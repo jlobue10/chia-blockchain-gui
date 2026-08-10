@@ -38,8 +38,9 @@ function hasExpectedChecksum(data: Buffer, expectedHash: string): boolean {
 export async function nftGetMetadata(
   metadataUri: string,
   expectedHash: string | undefined,
+  timeoutBudget: number = Number.POSITIVE_INFINITY,
 ): Promise<NftMetadata | undefined> {
-  if (!expectedHash) {
+  if (!expectedHash || timeoutBudget <= 0) {
     return undefined;
   }
 
@@ -48,7 +49,7 @@ export async function nftGetMetadata(
       headers: {
         Accept: 'application/json',
       },
-      timeout: METADATA_TIMEOUT,
+      timeout: Math.min(METADATA_TIMEOUT, timeoutBudget),
       maxSize: METADATA_MAX_SIZE,
     });
 
@@ -71,8 +72,9 @@ export async function nftGetMetadata(
 export async function nftGetImageDataUrl(
   imageUri: string,
   expectedHash: string | undefined,
+  timeoutBudget: number = Number.POSITIVE_INFINITY,
 ): Promise<string | undefined> {
-  if (!expectedHash) {
+  if (!expectedHash || timeoutBudget <= 0) {
     return undefined;
   }
 
@@ -81,7 +83,7 @@ export async function nftGetImageDataUrl(
       headers: {
         Accept: 'image/*',
       },
-      timeout: IMAGE_TIMEOUT,
+      timeout: Math.min(IMAGE_TIMEOUT, timeoutBudget),
       maxSize: IMAGE_MAX_SIZE,
     });
 
