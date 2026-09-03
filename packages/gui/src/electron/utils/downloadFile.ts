@@ -84,6 +84,9 @@ type DownloadFileOptions = {
   maxSize?: number; // values <= 0 disable the size limit
   onProgress?: (progress: number, size: number, downloadedSize: number) => void;
   overrideFile?: boolean;
+  // the gateway base an ipfs:// url is fetched through; defaults to the
+  // current preference (see toFetchableUrl)
+  gatewayBase?: string;
 };
 
 export default async function downloadFile(
@@ -96,6 +99,7 @@ export default async function downloadFile(
     maxSize = 100 * 1024 * 1024,
     onProgress,
     overrideFile = false,
+    gatewayBase,
   }: DownloadFileOptions = {},
 ): Promise<Headers> {
   if (!isValidURL(url)) {
@@ -117,7 +121,7 @@ export default async function downloadFile(
   // with the option off toFetchableUrl refuses the fetch outright. Only
   // this outgoing request uses the translated URL; callers keep the original
   // URI as the cache key.
-  const request = net.request(toFetchableUrl(url));
+  const request = net.request(toFetchableUrl(url, gatewayBase));
   const outputStream = new WriteStreamPromise(tempFilePath, overrideFile);
 
   // set when we abort the request ourselves, so abort events can be reported
