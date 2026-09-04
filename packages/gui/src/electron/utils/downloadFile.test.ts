@@ -77,6 +77,40 @@ describe('downloadFile', () => {
     expect(mockNetRequest).not.toHaveBeenCalled();
   });
 
+  it('requests the override URL, identified as the application, while keeping the cache key', async () => {
+    const request = Object.assign(new EventEmitter(), {
+      abort: jest.fn(),
+      setHeader: jest.fn(),
+      end: jest.fn(() => {
+        const response = Object.assign(new EventEmitter(), { statusCode: 404, headers: {} });
+        request.emit('response', response);
+      }),
+    });
+    request.abort.mockImplementation(() => request.emit('abort'));
+    mockNetRequest.mockReturnValue(request);
+
+    await expect(
+      downloadFile(
+        'https://nftstorage.link/ipfs/bafybeigdyrztest/img.png',
+        path.join(os.tmpdir(), 'downloadFile-test-override.png'),
+        { requestUrl: 'https://gateway.pinata.cloud/ipfs/bafybeigdyrztest/img.png' },
+      ),
+    ).rejects.toThrow('HTTP error: 404');
+
+    expect(mockNetRequest).toHaveBeenCalledWith('https://gateway.pinata.cloud/ipfs/bafybeigdyrztest/img.png');
+    expect(request.setHeader).toHaveBeenCalledWith('User-Agent', expect.stringMatching(/^Chia-Blockchain-GUI\//));
+  });
+
+  it('rejects an invalid override URL before requesting anything', async () => {
+    await expect(
+      downloadFile('https://example.com/img.png', path.join(os.tmpdir(), 'downloadFile-test-bad-override.png'), {
+        requestUrl: 'not a url',
+      }),
+    ).rejects.toThrow('Invalid URL');
+
+    expect(mockNetRequest).not.toHaveBeenCalled();
+  });
+
   it('does not start a transfer whose signal was aborted while queued', async () => {
     const abortController = new AbortController();
     abortController.abort();
