@@ -864,34 +864,32 @@ export default class CacheManager extends EventEmitter {
       const files = await fs.readdir(oldDirectory);
       const moved: { file: string; source: string; destination: string }[] = [];
       try {
-        for (const file of files) {
-          if (!isChiaCacheFile(file)) {
-            continue;
-          }
+        for (const file of files.filter((name) => isChiaCacheFile(name))) {
           const source = path.join(oldDirectory, file);
           const destination = path.join(newDirectory, file);
           if (isChiaCacheTempFile(file)) {
+            // a leftover: nothing in flight is left by now
             // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
             await safeUnlink(source);
-            continue;
-          }
-          try {
-            // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
-            const stat = await fs.lstat(source);
-            if (stat.isFile()) {
-              // Do not overwrite a pre-existing cache in the destination. Copy
-              // first also permits cross-volume migration; remove the source
-              // only after the entire copy pass has succeeded.
+          } else {
+            try {
               // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
-              await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
-              moved.push({ file, source, destination });
-            }
-          } catch (error) {
-            // A source that vanished since the listing — deleted from outside,
-            // or by an invalidation that beat the barrier — has nothing to
-            // migrate; it must not fail the whole move.
-            if ((error as { code?: string }).code !== 'ENOENT') {
-              throw error;
+              const stat = await fs.lstat(source);
+              if (stat.isFile()) {
+                // Do not overwrite a pre-existing cache in the destination. Copy
+                // first also permits cross-volume migration; remove the source
+                // only after the entire copy pass has succeeded.
+                // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
+                await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+                moved.push({ file, source, destination });
+              }
+            } catch (error) {
+              // A source that vanished since the listing — deleted from outside,
+              // or by an invalidation that beat the barrier — has nothing to
+              // migrate; it must not fail the whole move.
+              if ((error as { code?: string }).code !== 'ENOENT') {
+                throw error;
+              }
             }
           }
         }

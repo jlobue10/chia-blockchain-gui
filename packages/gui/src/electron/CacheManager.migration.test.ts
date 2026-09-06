@@ -50,9 +50,9 @@ describe('CacheManager directory migration', () => {
       .mockImplementationOnce(async (_url, file, options) => {
         await fs.writeFile(`${file}.tmp`, 'partial');
         started.resolve();
-        await new Promise<void>((resolve) =>
-          options?.signal?.addEventListener('abort', () => resolve(), { once: true }),
-        );
+        await new Promise<void>((resolve) => {
+          options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
         aborted.resolve();
         await finish.promise;
         await fs.unlink(`${file}.tmp`);
