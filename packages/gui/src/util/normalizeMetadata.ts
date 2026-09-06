@@ -78,11 +78,17 @@ export default function normalizeMetadata(parsed: unknown): Metadata {
       })
     : undefined;
 
+  // CHIP-0007 allows a boolean, a string naming the kind of sensitive
+  // content, or a list of such strings; hasSensitiveContent treats any of
+  // them but false/"false" as sensitive, so all of those forms are kept.
   const sensitiveContent = parsed.sensitive_content;
-  const sensitive =
-    typeof sensitiveContent === 'boolean' || sensitiveContent === 'true' || sensitiveContent === 'false'
-      ? sensitiveContent
-      : undefined;
+  let sensitive: boolean | string | string[] | undefined;
+  if (typeof sensitiveContent === 'boolean' || typeof sensitiveContent === 'string') {
+    sensitive = sensitiveContent;
+  } else if (Array.isArray(sensitiveContent)) {
+    const kinds = sensitiveContent.filter((kind): kind is string => typeof kind === 'string');
+    sensitive = kinds.length > 0 ? kinds : undefined;
+  }
 
   return withoutUndefined({
     ...parsed,

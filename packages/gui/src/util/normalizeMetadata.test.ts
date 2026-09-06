@@ -50,13 +50,26 @@ describe('normalizeMetadata', () => {
       description: { nested: 'document' },
       attributes: [{ trait_type: 'Level', value: 7 }, { trait_type: {}, value: 'x' }, 'stray', null],
       collection: { name: ['not', 'text'], id: 9, attributes: 'none' },
-      sensitive_content: 'yes',
+      sensitive_content: 7,
     });
     expect(metadata.name).toBe('12');
     expect(metadata).not.toHaveProperty('description');
     expect(metadata.attributes).toEqual([{ trait_type: 'Level', value: '7' }]);
     expect(metadata.collection).toEqual({ id: '9' });
     expect(metadata).not.toHaveProperty('sensitive_content');
+  });
+
+  it.each([true, false, 'true', 'false', 'nudity', ['nudity', 'violence']])(
+    'keeps a sensitive-content flag of %p',
+    (flag) => {
+      expect(normalizeMetadata({ sensitive_content: flag }).sensitive_content).toEqual(flag);
+    },
+  );
+
+  it('keeps only the strings of a sensitive-content list and drops an empty one', () => {
+    expect(normalizeMetadata({ sensitive_content: ['nudity', 3, null] }).sensitive_content).toEqual(['nudity']);
+    expect(normalizeMetadata({ sensitive_content: [3] })).not.toHaveProperty('sensitive_content');
+    expect(normalizeMetadata({ sensitive_content: {} })).not.toHaveProperty('sensitive_content');
   });
 
   it('drops a collection that is not an object', () => {
