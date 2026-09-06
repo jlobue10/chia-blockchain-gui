@@ -5,6 +5,7 @@ import debug from 'debug';
 
 import type Headers from '../../@types/Headers';
 
+import { DEFAULT_DOWNLOAD_MAX_DURATION } from './DownloadDeadline';
 import fileExists from './fileExists';
 import { toFetchableUrl } from './ipfsGateway';
 import isValidURL from './isValidURL';
@@ -59,7 +60,7 @@ class WriteStreamPromise {
     });
   }
 
-  on(event: string, listener: () => void) {
+  on(event: string, listener: (...args: any[]) => void) {
     return this.stream.on(event, listener);
   }
 }
@@ -89,7 +90,7 @@ export default async function downloadFile(
   localPath: string,
   {
     timeout = 30_000,
-    maxDuration = 30 * 60 * 1000,
+    maxDuration = DEFAULT_DOWNLOAD_MAX_DURATION,
     signal,
     maxSize = 100 * 1024 * 1024,
     onProgress,
@@ -206,7 +207,8 @@ export default async function downloadFile(
         throw error ?? new Error('Unknown error');
       } catch (e) {
         log('Download failed', url, (e as Error)?.message);
-        await fs.unlink(tempFilePath);
+        // Failed cleanup must not prevent rejection and leak a limiter slot.
+        await fs.unlink(tempFilePath).catch(() => {});
         reject(e);
       }
     }
@@ -278,6 +280,11 @@ export default async function downloadFile(
 
     request.on('error', (error = new Error('Unknown request error')) => {
       resolvePromise(false, error);
+    });
+
+    outputStream.on('error', (error: Error = new Error('Unknown write error')) => {
+      resolvePromise(false, error);
+      request.abort();
     });
 
     if (signal) {

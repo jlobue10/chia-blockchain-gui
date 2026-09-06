@@ -10,12 +10,14 @@ import debug from 'debug';
 
 import type CacheInfo from '../@types/CacheInfo';
 import type CacheInfoBase from '../@types/CacheInfoBase';
+import type { CacheContent, CacheRequestOptions } from '../@types/CacheService';
 import type Headers from '../@types/Headers';
 import CacheState from '../constants/CacheState';
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
 import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isDownloadTimeoutError } from './utils/downloadFile';
+import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -111,8 +113,14 @@ export default class CacheManager extends EventEmitter {
     {
       promise: Promise<CacheInfo>;
       abort: () => void;
+      deadline: DownloadDeadline;
     }
   > = new Map();
+
+  // Shared with the cache-maintenance change in #3068. Its clear/migration
+  // operations populate this barrier; bundle reads must honor it just as
+  // getContent does there. It is otherwise unset on this independent branch.
+  private maintenance: Promise<void> | undefined;
 
   // URLs whose download timed out during this session. A persisted timeout is
   // retried once per session — the set keeps a stalled host from being retried
@@ -227,16 +235,19 @@ export default class CacheManager extends EventEmitter {
     ipcMainHandle(CacheAPI.CLEAR_CACHE, () => this.clearCache());
     ipcMainHandle(CacheAPI.SET_CACHE_DIRECTORY, () => this.setCacheDirectory());
     ipcMainHandle(CacheAPI.SET_MAX_CACHE_SIZE, (newSize: number) => this.setMaxCacheSize(newSize));
-    ipcMainHandle(CacheAPI.GET_CONTENT, (url: string, options?: { maxSize?: number; timeout?: number }) =>
+    ipcMainHandle(CacheAPI.GET_CONTENT_WITH_INFO, (url: string, options?: CacheRequestOptions) =>
+      this.getContentWithInfo(url, options),
+    );
+    ipcMainHandle(CacheAPI.GET_CONTENT, (url: string, options?: CacheRequestOptions) =>
       this.getContent(url, options),
     );
-    ipcMainHandle(CacheAPI.GET_HEADERS, (url: string, options?: { maxSize?: number; timeout?: number }) =>
+    ipcMainHandle(CacheAPI.GET_HEADERS, (url: string, options?: CacheRequestOptions) =>
       this.getHeaders(url, options),
     );
-    ipcMainHandle(CacheAPI.GET_CHECKSUM, (url: string, options?: { maxSize?: number; timeout?: number }) =>
+    ipcMainHandle(CacheAPI.GET_CHECKSUM, (url: string, options?: CacheRequestOptions) =>
       this.getChecksum(url, options),
     );
-    ipcMainHandle(CacheAPI.GET_URI, (url: string, options?: { maxSize?: number; timeout?: number }) =>
+    ipcMainHandle(CacheAPI.GET_URI, (url: string, options?: CacheRequestOptions) =>
       this.getURI(url, options),
     );
     ipcMainHandle(CacheAPI.INVALIDATE, (url: string) => this.invalidate(url));
@@ -411,14 +422,10 @@ export default class CacheManager extends EventEmitter {
     }
   }
 
-  async fetchRemoteContent(
-    url: string,
-    options: {
-      maxSize?: number;
-      timeout?: number;
-    } = {},
-  ): Promise<CacheInfo> {
+  async fetchRemoteContent(url: string, options: CacheRequestOptions = {}): Promise<CacheInfo> {
     const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
+    // Validate before coalescing, reading sidecars, or queuing network work.
+    const maxDuration = normalizeDownloadDuration(options.maxDuration);
 
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
@@ -427,10 +434,17 @@ export default class CacheManager extends EventEmitter {
     const ongoingRequest = this.ongoingRequests.get(url);
     if (ongoingRequest) {
       log('Request already ongoing', url);
+      ongoingRequest.deadline.constrain(maxDuration);
       return ongoingRequest.promise;
     }
 
     const abortController = new AbortController();
+    const transferDeadline = new DownloadDeadline(maxDuration, () => abortController.abort());
+    let ongoingRequestEntry: {
+      promise: Promise<CacheInfo>;
+      abort: () => void;
+      deadline: DownloadDeadline;
+    } | undefined;
 
     const process = async (): Promise<CacheInfo> => {
       try {
@@ -472,19 +486,25 @@ export default class CacheManager extends EventEmitter {
         const limitedRemoteFileDownload = async (): Promise<CacheInfo> => {
           const cacheFilePath = this.getCacheFilePath(url);
 
+          // Queue wait consumes no transfer allowance. The main-process timer
+          // also lets a later metadata caller shorten an already-active request.
+          transferDeadline.start();
           log('Starting download', url);
           const headers = await downloadFile(url, cacheFilePath, {
             timeout,
             maxSize,
+            maxDuration: transferDeadline.remaining(),
             signal: abortController.signal,
             overrideFile: true,
           });
 
+          transferDeadline.throwIfExpired();
           log('Download finished', url);
 
           // compute checksum
           const checksum = await getChecksum(cacheFilePath);
 
+          transferDeadline.throwIfExpired();
           log('Checksum computed', url);
 
           // save headers to a local JSON file
@@ -526,7 +546,7 @@ export default class CacheManager extends EventEmitter {
           throw error;
         }
 
-        const currentError = (error as Error) ?? new Error('Unknown fetchRemoteContent error');
+        const currentError = transferDeadline.error ?? (error as Error) ?? new Error('Unknown fetchRemoteContent error');
 
         if (isDownloadTimeoutError(currentError.message)) {
           this.timedOutUrls.add(url);
@@ -537,27 +557,27 @@ export default class CacheManager extends EventEmitter {
           error: currentError.message,
         });
       } finally {
-        this.ongoingRequests.delete(url);
+        transferDeadline.dispose();
+        // Clearing may have allowed a replacement request under this key.
+        if (this.ongoingRequests.get(url) === ongoingRequestEntry) {
+          this.ongoingRequests.delete(url);
+        }
       }
     };
 
     const promise = process();
 
-    this.ongoingRequests.set(url, {
+    ongoingRequestEntry = {
       abort: () => abortController.abort(),
       promise,
-    });
+      deadline: transferDeadline,
+    };
+    this.ongoingRequests.set(url, ongoingRequestEntry);
 
     return promise;
   }
 
-  async getHeaders(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ): Promise<Headers> {
+  async getHeaders(url: string, options?: CacheRequestOptions): Promise<Headers> {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
@@ -579,13 +599,7 @@ export default class CacheManager extends EventEmitter {
     throw new Error('Unknown cache state');
   }
 
-  async getContent(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ): Promise<Buffer> {
+  async getContent(url: string, options?: CacheRequestOptions): Promise<Buffer> {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
@@ -608,13 +622,31 @@ export default class CacheManager extends EventEmitter {
     throw new Error('Unknown cache state');
   }
 
-  async getChecksum(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ): Promise<string> {
+  // Metadata needs headers, checksum and bytes from ONE download decision.
+  // Three independent calls could re-download after eviction/invalidation,
+  // spending an attempt's transfer allowance three times. Hash the bytes we
+  // return so a concurrent replacement cannot pair new bytes with an old hash.
+  async getContentWithInfo(url: string, options?: CacheRequestOptions): Promise<CacheContent> {
+    const cacheInfo = await this.fetchRemoteContent(url, options);
+    if (cacheInfo.state === CacheState.ERROR) {
+      throw new Error(cacheInfo.error);
+    }
+    if (cacheInfo.state !== CacheState.CACHED) {
+      throw new Error('Url is not cached');
+    }
+    while (this.maintenance) {
+      // eslint-disable-next-line no-await-in-loop -- Read the completed destination, not a half-migrated pair.
+      await this.maintenance.catch(() => {});
+    }
+    const content = await fs.readFile(this.getCacheFilePath(url));
+    return {
+      content,
+      headers: cacheInfo.headers,
+      checksum: crypto.createHash('sha256').update(content).digest('hex'),
+    };
+  }
+
+  async getChecksum(url: string, options?: CacheRequestOptions): Promise<string> {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
@@ -636,13 +668,7 @@ export default class CacheManager extends EventEmitter {
     throw new Error('Unknown cache state');
   }
 
-  async getURI(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ) {
+  async getURI(url: string, options?: CacheRequestOptions) {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
