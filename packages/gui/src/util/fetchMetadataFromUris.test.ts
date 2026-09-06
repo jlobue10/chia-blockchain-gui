@@ -21,18 +21,47 @@ describe('fetchMetadataFromUris', () => {
     expect(fetchOne).toHaveBeenLastCalledWith(uris[MAX_METADATA_URI_ATTEMPTS - 1], 'ab');
   });
 
-  it('starts no further attempt once the shared budget is spent', async () => {
+  it('starts no further attempt once the budget that opened with the first failure is spent', async () => {
     let now = Date.now();
     const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
-    // the first host holds the connection for the whole budget before failing
-    const fetchOne = jest.fn().mockImplementation(async () => {
-      now += METADATA_URI_BUDGET_MS;
-      throw new Error('Request timed out after 30000ms of inactivity');
-    });
+    const THIRD_URI = 'https://mirror.example/metadata.json';
+    const fetchOne = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('HTTP error: 503'))
+      // the second host holds the connection for the whole budget before failing
+      .mockImplementationOnce(async () => {
+        now += METADATA_URI_BUDGET_MS;
+        throw new Error('Request timed out after 30000ms of inactivity');
+      })
+      .mockResolvedValueOnce(METADATA);
 
     try {
-      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).rejects.toThrow('Request timed out');
-      expect(fetchOne).toHaveBeenCalledTimes(1);
+      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI, THIRD_URI], 'ab', fetchOne)).rejects.toThrow(
+        'HTTP error: 503',
+      );
+      expect(fetchOne).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  // A gallery-wide pass starts every NFT's walk at once, and each first
+  // attempt then waits in the cache's download queue — time no host consumed,
+  // which must not use up the budget meant for the fallbacks.
+  it('does not charge time the first attempt spent queued against the fallbacks', async () => {
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchOne = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        now += 10 * METADATA_URI_BUDGET_MS; // queued for a long while, then the host fails fast
+        throw new Error('HTTP error: 403');
+      })
+      .mockResolvedValueOnce(METADATA);
+
+    try {
+      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).resolves.toEqual(METADATA);
+      expect(fetchOne).toHaveBeenCalledTimes(2);
     } finally {
       nowSpy.mockRestore();
     }
@@ -43,6 +72,7 @@ describe('fetchMetadataFromUris', () => {
     const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
     const fetchOne = jest
       .fn()
+      .mockRejectedValueOnce(new Error('HTTP error: 504'))
       .mockImplementationOnce(async () => {
         now += METADATA_URI_BUDGET_MS / 2;
         throw new Error('HTTP error: 504');
@@ -50,8 +80,10 @@ describe('fetchMetadataFromUris', () => {
       .mockResolvedValueOnce(METADATA);
 
     try {
-      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).resolves.toEqual(METADATA);
-      expect(fetchOne).toHaveBeenCalledTimes(2);
+      await expect(
+        fetchMetadataFromUris([HTTPS_URI, IPFS_URI, 'https://mirror.example/metadata.json'], 'ab', fetchOne),
+      ).resolves.toEqual(METADATA);
+      expect(fetchOne).toHaveBeenCalledTimes(3);
     } finally {
       nowSpy.mockRestore();
     }

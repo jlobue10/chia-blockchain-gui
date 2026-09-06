@@ -22,7 +22,11 @@ export type FetchMetadata = (uri: string, hash: string | undefined) => Promise<M
  * reachable — data files already fall through their URI list this way.
  *
  * The walk is bounded: at most MAX_METADATA_URI_ATTEMPTS URIs are tried, and
- * none is started once METADATA_URI_BUDGET_MS have passed since the first.
+ * none is started once METADATA_URI_BUDGET_MS have passed since the first
+ * attempt *settled*. The clock starts then rather than at the call, because
+ * the first attempt may spend a long time queued behind the cache's shared
+ * download limiter during a gallery-wide pass — time no host consumed, which
+ * must not be charged against the fallbacks that were never tried.
  * Without an on-chain hash there is nothing to tell one copy from another,
  * so further URIs would add fetches without adding confidence — only the
  * first is tried, as before this walk existed. (The data-file verifier and
@@ -43,13 +47,13 @@ export default async function fetchMetadataFromUris(
   }
 
   const candidates = hash ? uris.slice(0, MAX_METADATA_URI_ATTEMPTS) : uris.slice(0, 1);
-  const deadline = Date.now() + METADATA_URI_BUDGET_MS;
 
+  let deadline: number | undefined;
   let firstError: Error | undefined;
   let mismatchError: Error | undefined;
 
   for (const uri of candidates) {
-    if (firstError && Date.now() >= deadline) {
+    if (deadline !== undefined && Date.now() >= deadline) {
       break;
     }
 
@@ -58,6 +62,8 @@ export default async function fetchMetadataFromUris(
       return await fetchOne(uri, hash);
     } catch (e) {
       const error = e as Error;
+      // the budget for the fallbacks opens when the first attempt settles
+      deadline ??= Date.now() + METADATA_URI_BUDGET_MS;
       firstError ??= error;
       if (!mismatchError && error.message === CHECKSUM_MISMATCH_ERROR) {
         mismatchError = error;
