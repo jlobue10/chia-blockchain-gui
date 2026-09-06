@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,7 @@ jest.mock('./utils/downloadFile', () => ({
   __esModule: true,
   default: mockDownloadFile,
   MAX_FILE_SIZE_EXCEEDED_ERROR: 'Maximum file size exceeded',
+  TEMP_FILE_SUFFIX: '.tmp',
   isDownloadTimeoutError: jest.requireActual('./utils/downloadFile').isDownloadTimeoutError,
 }));
 
@@ -26,6 +28,18 @@ jest.mock('./utils/ipcMainHandle', () => ({
 }));
 
 const CacheManager = jest.requireActual<typeof import('./CacheManager')>('./CacheManager').default;
+
+// The download starts only after the sidecar has been read, so a test that
+// interferes with an in-flight download has to wait for it to actually start.
+async function untilDownloadsStarted(count: number) {
+  for (let attempt = 0; attempt < 200 && mockDownloadFile.mock.calls.length < count; attempt += 1) {
+    // eslint-disable-next-line no-await-in-loop -- polling
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+  }
+  expect(mockDownloadFile).toHaveBeenCalledTimes(count);
+}
 
 describe('CacheManager eviction', () => {
   let cacheDirectory: string;
@@ -245,6 +259,103 @@ describe('CacheManager eviction', () => {
     expect(cacheManager.maxCacheSize).toBe(0);
     await expect(cacheManager.getContent('https://example.com/nft.png')).resolves.toEqual(payload);
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  // Downloads stream into `<file>.tmp` and rename into place; a quit or crash
+  // mid-download leaves the temp file behind. Those files are the cache's too.
+  it('sweeps leftover temp files at startup', async () => {
+    const stale = path.join(cacheDirectory, 'aaaa-chiacache.tmp');
+    await fs.writeFile(stale, Buffer.alloc(300));
+    await fs.writeFile(path.join(cacheDirectory, 'bbbb-chiacache'), Buffer.alloc(100));
+    await fs.writeFile(path.join(cacheDirectory, 'unrelated.tmp'), Buffer.alloc(50));
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    await expect(fs.stat(stale)).rejects.toThrow('ENOENT');
+    // cached files, and files that are not the cache's, are left alone
+    await expect(fs.stat(path.join(cacheDirectory, 'bbbb-chiacache'))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(cacheDirectory, 'unrelated.tmp'))).resolves.toBeDefined();
+  });
+
+  it('counts temp files toward the cache size and removes them with the cache', async () => {
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const temp = path.join(cacheDirectory, 'aaaa-chiacache.tmp');
+    await fs.writeFile(temp, Buffer.alloc(300));
+    await fs.writeFile(path.join(cacheDirectory, 'bbbb-chiacache'), Buffer.alloc(100));
+
+    await expect(cacheManager.getCacheSize()).resolves.toBe(400);
+
+    await cacheManager.clearCache();
+    await expect(fs.stat(temp)).rejects.toThrow('ENOENT');
+    await expect(cacheManager.getCacheSize()).resolves.toBe(0);
+  });
+
+  it('evicts a stale temp file but never the one a download in flight is writing', async () => {
+    let finishDownload!: () => void;
+    const inFlightUrl = 'https://example.com/in-flight.png';
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      // the real downloadFile streams into the temp file before renaming it
+      await fs.writeFile(`${localPath}.tmp`, Buffer.alloc(300));
+      await new Promise<void>((resolve) => {
+        finishDownload = resolve;
+      });
+      await fs.rename(`${localPath}.tmp`, localPath);
+      return {
+        'content-type': 'image/png',
+      };
+    });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const stale = path.join(cacheDirectory, 'aaaa-chiacache.tmp');
+    await fs.writeFile(stale, Buffer.alloc(300));
+
+    const pending = cacheManager.getContent(inFlightUrl);
+    await untilDownloadsStarted(1);
+    const inFlightTemp = (await fs.readdir(cacheDirectory)).find(
+      (file) => file.endsWith('.tmp') && file !== 'aaaa-chiacache.tmp',
+    );
+    expect(inFlightTemp).toBeDefined();
+
+    // both temp files count; evicting down to 350 bytes must drop the stale
+    // one and keep the live one
+    await expect(cacheManager.getCacheSize()).resolves.toBe(600);
+    await cacheManager.setMaxCacheSize(350);
+    await expect(fs.stat(stale)).rejects.toThrow('ENOENT');
+    await expect(fs.stat(path.join(cacheDirectory, inFlightTemp!))).resolves.toBeDefined();
+
+    finishDownload();
+    await expect(pending).resolves.toEqual(Buffer.alloc(300));
+  });
+
+  it('reports a sidecar that cannot be read by its error code, not its path', async () => {
+    const url = 'https://example.com/nft.png';
+    const urlHash = crypto.createHash('md5').update(url).digest('hex');
+    // a directory where the sidecar should be makes readFile fail with EISDIR
+    await fs.mkdir(path.join(cacheDirectory, `${urlHash}-chiacache-info`));
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info).toMatchObject({ state: 'ERROR', error: 'EISDIR' });
+    expect(info.state === 'ERROR' && info.error.includes(cacheDirectory)).toBe(false);
   });
 });
 

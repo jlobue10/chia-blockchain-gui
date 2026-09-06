@@ -66,6 +66,11 @@ class WriteStreamPromise {
 
 export const MAX_FILE_SIZE_EXCEEDED_ERROR = 'Maximum file size exceeded';
 
+// A download streams into `<localPath>.tmp` and is renamed into place once it
+// completes, so a partial file is never served. CacheManager accounts for,
+// evicts and sweeps these files by the same suffix.
+export const TEMP_FILE_SUFFIX = '.tmp';
+
 const INACTIVITY_TIMEOUT_ERROR_PREFIX = 'Request timed out after';
 const DOWNLOAD_DEADLINE_ERROR_PREFIX = 'Request exceeded the';
 
@@ -109,7 +114,7 @@ export default async function downloadFile(
     throw new Error('Request aborted');
   }
 
-  const tempFilePath = `${localPath}.tmp`;
+  const tempFilePath = `${localPath}${TEMP_FILE_SUFFIX}`;
   // ipfs:// URIs are fetched through an HTTPS gateway when the user has
   // enabled it — Electron's net stack cannot request the ipfs scheme, and
   // with the option off toFetchableUrl refuses the fetch outright. Only

@@ -15,7 +15,11 @@ import CacheState from '../constants/CacheState';
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
-import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isDownloadTimeoutError } from './utils/downloadFile';
+import downloadFile, {
+  MAX_FILE_SIZE_EXCEEDED_ERROR,
+  TEMP_FILE_SUFFIX,
+  isDownloadTimeoutError,
+} from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -85,7 +89,13 @@ const FILE_SUFFIX = '-chiacache';
 const MAX_TOTAL_SIZE = 1024 * 1024 * 1024; // 1GB
 const MAX_FILE_SIZE = 1024 * 1024 * 100; // 100MB
 
-const SUFFIXES = [FILE_SUFFIX, `${FILE_SUFFIX}${INFO_SUFFIX}`];
+// Every file the cache owns: the data file, its `-info` sidecar, and the
+// `.tmp` file a download streams into before it is renamed into place. The
+// temp files count too — an interrupted download (quit, crash, a failed
+// cleanup) leaves one behind, and a file the size accounting, eviction and
+// "Clear cache" cannot see would grow the directory past the user's limit
+// with no way to reclaim it from the UI.
+const SUFFIXES = [FILE_SUFFIX, `${FILE_SUFFIX}${INFO_SUFFIX}`, `${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`];
 
 function isChiaCacheFile(filePath: string) {
   return SUFFIXES.some((suffix) => filePath.endsWith(suffix));
@@ -93,6 +103,10 @@ function isChiaCacheFile(filePath: string) {
 
 function isChiaCacheInfoFile(filePath: string) {
   return isChiaCacheFile(filePath) && filePath.endsWith(INFO_SUFFIX);
+}
+
+function isChiaCacheTempFile(filePath: string) {
+  return filePath.endsWith(`${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`);
 }
 
 function getInfoFilePath(filePath: string) {
@@ -317,6 +331,44 @@ export default class CacheManager extends EventEmitter {
 
   async init() {
     await ensureDirectoryExists(this.cacheDirectory);
+    await this.removeStaleTempFiles();
+  }
+
+  // Deletes the temp files of downloads that are not in flight. At startup
+  // that is every temp file: none can belong to a live download. Errors are
+  // ignored — a file that cannot be removed is still counted and evictable.
+  private async removeStaleTempFiles() {
+    let files: string[];
+    try {
+      files = await fs.readdir(this.cacheDirectory);
+    } catch (error) {
+      log(`Could not list the cache directory for stale temp files: ${(error as Error).message}`);
+      return;
+    }
+
+    const inFlight = this.inFlightTempFilePaths();
+    await Promise.all(
+      files
+        .filter((file) => isChiaCacheTempFile(file))
+        .map((file) => path.join(this.cacheDirectory, file))
+        .filter((filePath) => !inFlight.has(filePath))
+        .map((filePath) => safeUnlink(filePath)),
+    );
+  }
+
+  // The temp files that downloads currently in flight are writing to. Their
+  // urls are the ongoing requests; a temp file that is not one of these is a
+  // leftover no download will ever finish.
+  private inFlightTempFilePaths(): Set<string> {
+    const paths = new Set<string>();
+    this.ongoingRequests.forEach((_request, url) => {
+      try {
+        paths.add(`${this.getCacheFilePath(url)}${TEMP_FILE_SUFFIX}`);
+      } catch {
+        // a url the cache cannot key has no file
+      }
+    });
+    return paths;
   }
 
   public get maxCacheSize(): number {
@@ -363,7 +415,8 @@ export default class CacheManager extends EventEmitter {
       return JSON.parse(infoString) as CacheInfo;
     } catch (error) {
       const currentError = (error as Error) ?? new Error('Unknown error');
-      if ((currentError as { code?: string }).code === 'ENOENT') {
+      const { code } = currentError as { code?: string };
+      if (code === 'ENOENT') {
         return {
           url,
           state: CacheState.NOT_CACHED,
@@ -371,10 +424,15 @@ export default class CacheManager extends EventEmitter {
         };
       }
 
+      // The full message of an fs error embeds the absolute path of the
+      // sidecar — the user's home directory included — and this record is
+      // handed to the renderer (getCacheInfos). The code says what went
+      // wrong; the path stays in the main process log.
+      log(`Could not read the cache info for ${url}: ${currentError.message}`);
       return {
         url,
         state: CacheState.ERROR,
-        error: currentError.message,
+        error: code ?? 'Cache info unreadable',
         timestamp: Date.now(),
       };
     }
@@ -727,6 +785,7 @@ export default class CacheManager extends EventEmitter {
 
     // move the files from the current cache directory to the new directory
     const files = await fs.readdir(this.cacheDirectory);
+    const inFlight = this.inFlightTempFilePaths();
     const movePromises = files.map(async (file) => {
       if (!isChiaCacheFile(file)) {
         return;
@@ -734,6 +793,15 @@ export default class CacheManager extends EventEmitter {
 
       const oldFilePath = path.join(this.cacheDirectory, file);
       const newFilePath = path.join(newDirectory, file);
+
+      // A temp file is either being written by a download in flight, which
+      // must keep its file where it is, or a leftover — deleted, not moved.
+      if (isChiaCacheTempFile(file)) {
+        if (!inFlight.has(oldFilePath)) {
+          await safeUnlink(oldFilePath);
+        }
+        return;
+      }
 
       const stat = await fs.lstat(oldFilePath);
 
@@ -749,6 +817,10 @@ export default class CacheManager extends EventEmitter {
 
   private async removeOldestFiles(targetSize: number, preserveFilePath?: string): Promise<void> {
     const files = await fs.readdir(this.cacheDirectory);
+    // Temp files of downloads in flight count toward the total like every
+    // other file but are never evicted — the download would fail; stale ones
+    // are evictable like any other file.
+    const inFlight = this.inFlightTempFilePaths();
     const filePaths = files
       .filter((file) => isChiaCacheFile(file) && !isChiaCacheInfoFile(file))
       .map((file) => path.join(this.cacheDirectory, file));
@@ -791,7 +863,7 @@ export default class CacheManager extends EventEmitter {
         break;
       }
 
-      if (fileStat.filePath !== preserveFilePath) {
+      if (fileStat.filePath !== preserveFilePath && !inFlight.has(fileStat.filePath)) {
         totalSize -= fileStat.size;
         filesToRemove.push(fileStat);
       }
