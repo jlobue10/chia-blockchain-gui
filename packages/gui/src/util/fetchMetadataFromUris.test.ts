@@ -1,10 +1,74 @@
-import fetchMetadataFromUris, { CHECKSUM_MISMATCH_ERROR } from './fetchMetadataFromUris';
+import fetchMetadataFromUris, {
+  CHECKSUM_MISMATCH_ERROR,
+  MAX_METADATA_URI_ATTEMPTS,
+  METADATA_URI_BUDGET_MS,
+} from './fetchMetadataFromUris';
 
 const METADATA = { name: 'Test NFT' };
 const HTTPS_URI = 'https://nftstorage.link/ipfs/bafybeigdyrztest/metadata.json';
 const IPFS_URI = 'ipfs://bafybeigdyrztest/metadata.json';
 
 describe('fetchMetadataFromUris', () => {
+  // The URI list is minter-authored and uncapped, and every attempt holds a
+  // shared download slot for as long as its host keeps the connection alive,
+  // so the walk is bounded in attempts and in time.
+  it('tries no more than MAX_METADATA_URI_ATTEMPTS URIs', async () => {
+    const uris = Array.from({ length: 20 }, (_, i) => `https://host-${i}.example/metadata.json`);
+    const fetchOne = jest.fn().mockRejectedValue(new Error('HTTP error: 503'));
+
+    await expect(fetchMetadataFromUris(uris, 'ab', fetchOne)).rejects.toThrow('HTTP error: 503');
+    expect(fetchOne).toHaveBeenCalledTimes(MAX_METADATA_URI_ATTEMPTS);
+    expect(fetchOne).toHaveBeenLastCalledWith(uris[MAX_METADATA_URI_ATTEMPTS - 1], 'ab');
+  });
+
+  it('starts no further attempt once the shared budget is spent', async () => {
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    // the first host holds the connection for the whole budget before failing
+    const fetchOne = jest.fn().mockImplementation(async () => {
+      now += METADATA_URI_BUDGET_MS;
+      throw new Error('Request timed out after 30000ms of inactivity');
+    });
+
+    try {
+      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).rejects.toThrow('Request timed out');
+      expect(fetchOne).toHaveBeenCalledTimes(1);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keeps falling through while the budget lasts', async () => {
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchOne = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        now += METADATA_URI_BUDGET_MS / 2;
+        throw new Error('HTTP error: 504');
+      })
+      .mockResolvedValueOnce(METADATA);
+
+    try {
+      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).resolves.toEqual(METADATA);
+      expect(fetchOne).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  // Without a hash no copy can be told from another, so a second host adds a
+  // fetch without adding confidence — the first URI serves as it always has.
+  it('tries only the first URI of an NFT that records no metadata hash', async () => {
+    const fetchOne = jest.fn().mockRejectedValue(new Error('HTTP error: 503'));
+
+    await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], undefined, fetchOne)).rejects.toThrow('HTTP error: 503');
+    await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], '', fetchOne)).rejects.toThrow('HTTP error: 503');
+    expect(fetchOne).toHaveBeenCalledTimes(2);
+    expect(fetchOne).toHaveBeenNthCalledWith(1, HTTPS_URI, undefined);
+    expect(fetchOne).toHaveBeenNthCalledWith(2, HTTPS_URI, '');
+  });
+
   it('returns the metadata served by the first URI without touching the others', async () => {
     const fetchOne = jest.fn().mockResolvedValue(METADATA);
 
