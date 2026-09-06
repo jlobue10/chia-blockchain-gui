@@ -126,6 +126,17 @@ function getInfoFilePath(filePath: string) {
   return `${filePath}${INFO_SUFFIX}`;
 }
 
+// The type the cache: response declares for a file. Only the media types the
+// preview renders are passed through from the remote header; anything else —
+// a document type, a script type, a type with parameters that are not a
+// charset, or nothing at all — is served as an opaque byte stream.
+const SERVED_CONTENT_TYPE = /^(image|video|audio|model)\/[\w.+-]+(?:;\s*charset=[\w-]+)?$/i;
+
+export function servedContentType(contentType: string | undefined): string {
+  const declared = contentType?.trim();
+  return declared && SERVED_CONTENT_TYPE.test(declared) ? declared : 'application/octet-stream';
+}
+
 export default class CacheManager extends EventEmitter {
   #cacheDirectory: string = './cache';
 
@@ -211,12 +222,19 @@ export default class CacheManager extends EventEmitter {
       }
 
       const contentTypeHeader = cacheInfo.headers?.['content-type'];
-      const contentType =
-        (Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader) || 'application/octet-stream';
+      const contentType = servedContentType(
+        Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader,
+      );
 
       const responseHeaders: Record<string, string> = {
         'content-type': contentType,
         'accept-ranges': 'bytes',
+        // The bytes and their declared type both come from whoever served the
+        // NFT's file. They are only ever shown through <img>, <video> and
+        // <audio>, so a response that could be read as a document — and its
+        // scripts — is denied here as well as by the renderer's policy.
+        'x-content-type-options': 'nosniff',
+        'content-security-policy': "default-src 'none'; sandbox",
       };
 
       // Media elements seek by sending Range requests. Without 206 responses

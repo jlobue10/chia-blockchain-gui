@@ -15,6 +15,7 @@ import {
 import fileExists from './fileExists';
 import { toFetchableUrl } from './ipfsGateway';
 import isValidURL, { isValidRequestURL } from './isValidURL';
+import guardRedirects from './redirectPolicy';
 import getRequestUserAgent from './requestUserAgent';
 
 const log = debug('chia-gui:downloadFile');
@@ -140,7 +141,10 @@ export default async function downloadFile(
   }
 
   const tempFilePath = `${localPath}.tmp`;
-  const request = net.request(fetchUrl);
+  // Redirects are followed one at a time, each checked against the same rule
+  // as the requested URL (see redirectPolicy), so a host cannot redirect the
+  // main process to a plain-http, loopback or private address.
+  const request = net.request({ url: fetchUrl, redirect: 'manual' });
   request.setHeader('User-Agent', getRequestUserAgent());
   const outputStream = new WriteStreamPromise(tempFilePath, overrideFile);
 
@@ -159,6 +163,8 @@ export default async function downloadFile(
     abortError = error;
     request.abort();
   }
+
+  guardRedirects(request, fetchUrl, abortWithError);
 
   let timeoutId: NodeJS.Timeout | null = null;
 
