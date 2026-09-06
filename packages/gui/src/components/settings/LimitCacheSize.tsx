@@ -1,5 +1,6 @@
-import { AlertDialog, ButtonLoading, Flex, Form, TextField, useOpenDialog } from '@chia-network/core';
+import { AlertDialog, Flex, Form, TextField, useOpenDialog } from '@chia-network/core';
 import { Trans } from '@lingui/macro';
+import { LoadingButton } from '@mui/lab';
 import React, { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 
@@ -88,7 +89,7 @@ export default function LimitCacheSize() {
             },
           }}
         />
-        <ButtonLoading
+        <LoadingButton
           size="small"
           disabled={!canSubmit}
           type="submit"
@@ -97,7 +98,7 @@ export default function LimitCacheSize() {
           color="secondary"
         >
           <Trans>Update</Trans>
-        </ButtonLoading>
+        </LoadingButton>
       </Flex>
     </Form>
   );
