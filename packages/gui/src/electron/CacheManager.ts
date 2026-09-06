@@ -458,17 +458,12 @@ export default class CacheManager extends EventEmitter {
       throw new Error(`Invalid URL: ${url}`);
     }
 
-    // A shared budget that is already spent buys nothing: not a transfer of
-    // its own (the download path refuses one below) and not a seat on
-    // another caller's. Joining would tighten that transfer's deadline to
-    // the floor and abort a healthy download someone else is waiting on,
-    // recording a deadline error against the url on their behalf. Refuse
-    // here instead, and persist nothing: the cache knows no more about the
-    // url than it did.
-    if (budget.remaining <= 0) {
-      throw new Error('Request exceeded the shared download deadline');
-    }
-    const maxDuration = Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining);
+    // What is left of the caller's allowance bounds any transfer it starts or
+    // joins. A spent allowance still reads the cache: content that is already
+    // there costs nothing to serve, and a recheck after a join or a
+    // maintenance wait commonly finds exactly that. The floor only matters
+    // to a transfer that is refused before it starts (below).
+    const maxDuration = Math.max(1, Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining));
 
     // Recheck after each await: another maintenance operation may have been
     // queued while this caller waited. No await separates the last check from
@@ -504,6 +499,15 @@ export default class CacheManager extends EventEmitter {
 
     const ongoingRequest = this.ongoingRequests.get(url);
     if (ongoingRequest) {
+      // A spent allowance buys no seat on another caller's transfer: joining
+      // would tighten that transfer's deadline to the floor and abort a
+      // healthy download someone else is waiting on, recording a deadline
+      // error against the url on their behalf. Refuse instead, and persist
+      // nothing: the cache knows no more about the url than it did.
+      if (budget.remaining <= 0) {
+        throw new Error('Request exceeded the shared download deadline');
+      }
+
       log('Request already ongoing', url);
       ongoingRequest.deadline.constrain(maxDuration);
 

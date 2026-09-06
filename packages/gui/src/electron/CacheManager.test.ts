@@ -790,6 +790,29 @@ describe('CacheManager eviction', () => {
     expect(info.state).toBe('CACHED');
   });
 
+  it('serves cached content to a caller whose shared budget is spent', async () => {
+    const payload = Buffer.from('cached payload');
+    const url = 'https://example.com/nft.png';
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'image/png' };
+    });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+
+    // a recheck whose allowance the transfer used up in full still finds the
+    // file it paid for: serving it needs no further transfer
+    await expect(cacheManager.fetchRemoteContent(url, {}, { remaining: 0 })).resolves.toMatchObject({
+      state: 'CACHED',
+    });
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
   it('does not fall back to the gateway once the host has used up the whole download deadline', async () => {
     const url = 'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
     let now = Date.now();
