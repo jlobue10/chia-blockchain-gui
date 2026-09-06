@@ -59,7 +59,7 @@ class WriteStreamPromise {
     });
   }
 
-  on(event: string, listener: () => void) {
+  on(event: string, listener: (...args: any[]) => void) {
     return this.stream.on(event, listener);
   }
 }
@@ -242,7 +242,12 @@ export default async function downloadFile(
         throw error ?? new Error('Unknown error');
       } catch (e) {
         log('Download failed', url, (e as Error)?.message);
-        await fs.unlink(tempFilePath);
+        // The temp file may never have been created (the stream failed to
+        // open) or may already be gone. Cleanup must not decide whether the
+        // promise settles: this runs from fire-and-forget event handlers, so a
+        // throw here would leave the caller — and its download slot — waiting
+        // forever.
+        await fs.unlink(tempFilePath).catch(() => {});
         reject(e);
       }
     }
@@ -314,6 +319,14 @@ export default async function downloadFile(
 
     request.on('error', (error = new Error('Unknown request error')) => {
       resolvePromise(false, error);
+    });
+
+    // A write stream that cannot open its file (missing cache directory, no
+    // permission, too many open files) reports it as an 'error' event; with no
+    // listener that is an uncaught exception in the main process.
+    outputStream.on('error', (error: Error = new Error('Unknown write error')) => {
+      resolvePromise(false, error);
+      request.abort();
     });
 
     if (signal) {
