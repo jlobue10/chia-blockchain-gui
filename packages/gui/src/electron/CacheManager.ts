@@ -747,26 +747,26 @@ export default class CacheManager extends EventEmitter {
   }
 
   async clearCache() {
-    // The temp files of downloads in flight are left to those downloads: the
-    // abort below makes each one fail, and its failure path removes its own
-    // temp file. Removing the file from under a download would only race its
-    // cleanup — and settle nothing sooner.
-    const inFlight = this.inFlightTempFilePaths();
-
-    // cancel all ongoing requests
-    for (const ongoingRequest of this.ongoingRequests.values()) {
+    // Cancel every ongoing request and wait for each to settle before the
+    // unlink pass. A download settles only as it fails or finishes: an aborted
+    // one removes its temp file and records its outcome then, and one already
+    // past its transfer may still rename its temp file into a cached file.
+    // Clearing before that would leave those files — and a fresh sidecar per
+    // abort — behind in a cache that was just reported empty; clearing from
+    // under a download would only race its own cleanup.
+    const ongoingRequests = Array.from(this.ongoingRequests.values());
+    for (const ongoingRequest of ongoingRequests) {
       ongoingRequest.abort();
     }
     this.ongoingRequests.clear();
+    await Promise.allSettled(ongoingRequests.map((ongoingRequest) => ongoingRequest.promise));
 
     const files = await fs.readdir(this.cacheDirectory);
     const unlinkPromises = files.map(async (file) => {
       const hasSuffix = SUFFIXES.some((suffix) => file.endsWith(suffix));
       if (hasSuffix) {
         const filePath = path.join(this.cacheDirectory, file);
-        if (!inFlight.has(filePath)) {
-          await safeUnlink(filePath);
-        }
+        await safeUnlink(filePath);
       }
     });
 

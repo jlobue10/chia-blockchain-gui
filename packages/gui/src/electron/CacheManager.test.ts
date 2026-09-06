@@ -292,7 +292,7 @@ describe('CacheManager eviction', () => {
     await expect(cacheManager.getCacheSize()).resolves.toBe(0);
   });
 
-  it('leaves the temp file of a download in flight to that download when clearing the cache', async () => {
+  it('waits for a download in flight to settle before clearing the cache, so nothing survives the clear', async () => {
     const inFlightUrl = 'https://example.com/in-flight.png';
     let tempFilePath = '';
     let cleanedUpByDownload = false;
@@ -321,10 +321,11 @@ describe('CacheManager eviction', () => {
 
     await cacheManager.clearCache();
 
+    // the clear waited for the aborted download to settle, so its temp file,
+    // the sidecar its abort recorded and the rest of the cache are all gone
     await expect(pending).rejects.toThrow('Request aborted');
     expect(cleanedUpByDownload).toBe(true);
-    await expect(fs.stat(tempFilePath)).rejects.toThrow('ENOENT');
-    await expect(fs.stat(path.join(cacheDirectory, 'bbbb-chiacache'))).rejects.toThrow('ENOENT');
+    await expect(fs.readdir(cacheDirectory)).resolves.toEqual([]);
   });
 
   it('evicts a stale temp file but never the one a download in flight is writing', async () => {
