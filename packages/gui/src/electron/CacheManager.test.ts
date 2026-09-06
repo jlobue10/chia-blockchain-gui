@@ -784,19 +784,24 @@ describe('CacheManager cache: responses', () => {
   it.each([
     ['image/png', 'image/png'],
     ['video/mp4; charset=binary', 'video/mp4; charset=binary'],
+    ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'],
+    ['audio/webm;codecs=opus', 'audio/webm; codecs=opus'],
     ['audio/ogg', 'audio/ogg'],
     ['model/gltf-binary', 'model/gltf-binary'],
+    ['image/svg+xml; foo=bar', 'image/svg+xml; foo=bar'],
     ['text/html', 'application/octet-stream'],
     ['text/html; charset=utf-8', 'application/octet-stream'],
     ['application/javascript', 'application/octet-stream'],
-    ['image/svg+xml; foo=bar', 'application/octet-stream'],
+    ['application/octet-stream', 'application/octet-stream'],
+    // a parameter that is not one (a smuggled header line) is not passed through
+    ['image/png; x=a\r\nX-Injected: 1', 'application/octet-stream'],
     ['', 'application/octet-stream'],
     [undefined, 'application/octet-stream'],
   ])('serves a stored type of %p as %p', (stored, served) => {
     expect(servedContentType(stored)).toBe(served);
   });
 
-  it('serves cached bytes as an opaque, sandboxed, unsniffable response when the remote type is not media', async () => {
+  it('serves cached bytes as an opaque, sandboxed response when the remote type is not media', async () => {
     const payload = Buffer.from('<script>alert(1)</script>');
     mockDownloadFile.mockImplementation(async (_url, localPath) => {
       await fs.writeFile(localPath, payload);
@@ -819,7 +824,7 @@ describe('CacheManager cache: responses', () => {
     const response = await handler!(new Request(cacheUrl));
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toBe('application/octet-stream');
-    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('x-content-type-options')).toBeNull();
     expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox");
     expect(Buffer.from(await response.arrayBuffer())).toEqual(payload);
   });
