@@ -497,6 +497,12 @@ export default class CacheManager extends EventEmitter {
 
     const abortController = new AbortController();
 
+    // this request's own entry in ongoingRequests, so that on settling it
+    // removes itself and not a later request for the same url that replaced it
+    // — a request that followed an abort (from a clear or an invalidation)
+    // registers under the same key while the aborted one is still settling
+    let ongoingRequestEntry: { promise: Promise<CacheInfo>; abort: () => void } | undefined;
+
     const process = async (): Promise<CacheInfo> => {
       try {
         // a clear in progress must finish before this request touches the
@@ -606,16 +612,19 @@ export default class CacheManager extends EventEmitter {
           error: currentError.message,
         });
       } finally {
-        this.ongoingRequests.delete(url);
+        if (this.ongoingRequests.get(url) === ongoingRequestEntry) {
+          this.ongoingRequests.delete(url);
+        }
       }
     };
 
     const promise = process();
 
-    this.ongoingRequests.set(url, {
+    ongoingRequestEntry = {
       abort: () => abortController.abort(),
       promise,
-    });
+    };
+    this.ongoingRequests.set(url, ongoingRequestEntry);
 
     return promise;
   }

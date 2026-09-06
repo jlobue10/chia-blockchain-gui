@@ -378,6 +378,52 @@ describe('CacheManager eviction', () => {
     await expect(fs.readdir(cacheDirectory)).resolves.toHaveLength(2); // its data file and sidecar
   });
 
+  it('keeps tracking a request that replaced one the clear aborted, so later callers join it', async () => {
+    const payload = Buffer.from('retried');
+    const url = 'https://example.com/nft.png';
+    let finishRetry!: () => void;
+    mockDownloadFile
+      .mockImplementationOnce(async (_url, localPath, options) => {
+        await fs.writeFile(`${localPath}.tmp`, Buffer.alloc(300));
+        await new Promise<void>((resolve) => {
+          options?.signal?.addEventListener('abort', () => resolve());
+        });
+        await fs.unlink(`${localPath}.tmp`);
+        throw new Error('Request aborted');
+      })
+      .mockImplementationOnce(async (_url, localPath) => {
+        await new Promise<void>((resolve) => {
+          finishRetry = resolve;
+        });
+        await fs.writeFile(localPath, payload);
+        return {
+          'content-type': 'image/png',
+        };
+      });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const aborted = cacheManager.getContent(url);
+    await untilDownloadsStarted(1);
+    // the same url is requested again the moment the abort is seen — while the
+    // aborted request is still settling and about to remove itself from the map
+    const retried = aborted.catch(() => cacheManager.getContent(url));
+    await cacheManager.clearCache();
+    await untilDownloadsStarted(2);
+
+    // a third caller must join the retry, not start a third download
+    const joined = cacheManager.getContent(url);
+    finishRetry();
+
+    await expect(retried).resolves.toEqual(payload);
+    await expect(joined).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+  });
+
   it('evicts a stale temp file but never the one a download in flight is writing', async () => {
     let finishDownload!: () => void;
     const inFlightUrl = 'https://example.com/in-flight.png';
