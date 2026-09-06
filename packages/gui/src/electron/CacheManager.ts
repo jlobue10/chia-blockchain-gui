@@ -747,6 +747,12 @@ export default class CacheManager extends EventEmitter {
   }
 
   async clearCache() {
+    // The temp files of downloads in flight are left to those downloads: the
+    // abort below makes each one fail, and its failure path removes its own
+    // temp file. Removing the file from under a download would only race its
+    // cleanup — and settle nothing sooner.
+    const inFlight = this.inFlightTempFilePaths();
+
     // cancel all ongoing requests
     for (const ongoingRequest of this.ongoingRequests.values()) {
       ongoingRequest.abort();
@@ -758,7 +764,9 @@ export default class CacheManager extends EventEmitter {
       const hasSuffix = SUFFIXES.some((suffix) => file.endsWith(suffix));
       if (hasSuffix) {
         const filePath = path.join(this.cacheDirectory, file);
-        await safeUnlink(filePath);
+        if (!inFlight.has(filePath)) {
+          await safeUnlink(filePath);
+        }
       }
     });
 

@@ -211,7 +211,12 @@ export default async function downloadFile(
         throw error ?? new Error('Unknown error');
       } catch (e) {
         log('Download failed', url, (e as Error)?.message);
-        await fs.unlink(tempFilePath);
+        // The temp file may already be gone — swept by CacheManager, or never
+        // created because the stream failed to open. Cleanup must not decide
+        // whether the promise settles: this runs from fire-and-forget event
+        // handlers, so a throw here would leave the caller, and the download
+        // slot it holds, waiting forever.
+        await fs.unlink(tempFilePath).catch(() => {});
         reject(e);
       }
     }

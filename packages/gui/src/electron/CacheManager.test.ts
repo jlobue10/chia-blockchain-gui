@@ -292,6 +292,41 @@ describe('CacheManager eviction', () => {
     await expect(cacheManager.getCacheSize()).resolves.toBe(0);
   });
 
+  it('leaves the temp file of a download in flight to that download when clearing the cache', async () => {
+    const inFlightUrl = 'https://example.com/in-flight.png';
+    let tempFilePath = '';
+    let cleanedUpByDownload = false;
+    mockDownloadFile.mockImplementation(async (_url, localPath, options) => {
+      // the real downloadFile streams into the temp file, and on abort removes
+      // it itself — which must still find it there
+      tempFilePath = `${localPath}.tmp`;
+      await fs.writeFile(tempFilePath, Buffer.alloc(300));
+      await new Promise<void>((resolve) => {
+        options?.signal?.addEventListener('abort', () => resolve());
+      });
+      await fs.unlink(tempFilePath);
+      cleanedUpByDownload = true;
+      throw new Error('Request aborted');
+    });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const pending = cacheManager.getContent(inFlightUrl);
+    await untilDownloadsStarted(1);
+    await fs.writeFile(path.join(cacheDirectory, 'bbbb-chiacache'), Buffer.alloc(100));
+
+    await cacheManager.clearCache();
+
+    await expect(pending).rejects.toThrow('Request aborted');
+    expect(cleanedUpByDownload).toBe(true);
+    await expect(fs.stat(tempFilePath)).rejects.toThrow('ENOENT');
+    await expect(fs.stat(path.join(cacheDirectory, 'bbbb-chiacache'))).rejects.toThrow('ENOENT');
+  });
+
   it('evicts a stale temp file but never the one a download in flight is writing', async () => {
     let finishDownload!: () => void;
     const inFlightUrl = 'https://example.com/in-flight.png';
