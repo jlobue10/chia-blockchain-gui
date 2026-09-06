@@ -157,8 +157,10 @@ class NFTPreviewErrorBoundary extends React.Component<{ children: ReactNode }, {
 }
 
 export default function NFTPreview(props: NFTPreviewProps) {
+  // keyed by the NFT: a failure is that NFT's, and the boundary starts
+  // afresh when the same tile (the detail view's arrows) shows another
   return (
-    <NFTPreviewErrorBoundary>
+    <NFTPreviewErrorBoundary key={props.id}>
       <NFTPreviewContent {...props} />
     </NFTPreviewErrorBoundary>
   );
