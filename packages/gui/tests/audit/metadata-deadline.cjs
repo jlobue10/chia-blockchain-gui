@@ -62,6 +62,7 @@ function environment() {
       requests.push(this);
     }
     setHeader() {}
+    followRedirect() {}
     end() {
       this.ended = true;
     }
@@ -89,7 +90,8 @@ function environment() {
   const moduleDefault = (x) => ({ __esModule: true, default: x });
   const state = { CACHED: 'CACHED', ERROR: 'ERROR', NOT_CACHED: 'NOT_CACHED' };
   const electron = {
-    net: { request: (url) => new Request(url) },
+    // downloadFile passes { url, redirect: 'manual' }; older callers a string
+    net: { request: (options) => new Request(typeof options === 'string' ? options : options.url) },
     BrowserWindow: class {},
     dialog: { showOpenDialog: async () => ({ canceled: true }) },
     contextBridge: { exposeInMainWorld: (name, value) => (exposed[name] = value) },

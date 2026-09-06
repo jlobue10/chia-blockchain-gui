@@ -23,6 +23,8 @@ import downloadFile, {
   MAX_FILE_SIZE_EXCEEDED_ERROR,
   TEMP_FILE_SUFFIX,
   isTransientDownloadError,
+  normalizeMaxSize,
+  normalizeTimeout,
 } from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
@@ -127,18 +129,30 @@ const CACHE_INFO_LOOKUP_CONCURRENCY = 16;
 // cleanup) leaves one behind, and a file the size accounting, eviction and
 // "Clear cache" cannot see would grow the directory past the user's limit
 // with no way to reclaim it from the UI.
-const SUFFIXES = [FILE_SUFFIX, `${FILE_SUFFIX}${INFO_SUFFIX}`, `${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`];
+// A sidecar is written beside its final name and renamed into place, so the
+// cache owns a fourth kind of file for the length of that write.
+const INFO_TEMP_SUFFIX = `${INFO_SUFFIX}${TEMP_FILE_SUFFIX}`;
+const SUFFIXES = [
+  FILE_SUFFIX,
+  `${FILE_SUFFIX}${INFO_SUFFIX}`,
+  `${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`,
+  `${FILE_SUFFIX}${INFO_TEMP_SUFFIX}`,
+];
 
 function isChiaCacheFile(filePath: string) {
   return SUFFIXES.some((suffix) => filePath.endsWith(suffix));
 }
 
+// A sidecar, finished or still being written: never a data file.
 function isChiaCacheInfoFile(filePath: string) {
-  return isChiaCacheFile(filePath) && filePath.endsWith(INFO_SUFFIX);
+  return isChiaCacheFile(filePath) && (filePath.endsWith(INFO_SUFFIX) || filePath.endsWith(INFO_TEMP_SUFFIX));
 }
 
+// A file a write is streaming into, data or sidecar; stale once no write is.
 function isChiaCacheTempFile(filePath: string) {
-  return filePath.endsWith(`${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`);
+  return (
+    filePath.endsWith(`${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`) || filePath.endsWith(`${FILE_SUFFIX}${INFO_TEMP_SUFFIX}`)
+  );
 }
 
 function getInfoFilePath(filePath: string) {
@@ -154,6 +168,17 @@ async function isCachedSidecar(infoFilePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// The type the cache: response declares for a file. Only the media types the
+// preview renders are passed through from the remote header; anything else —
+// a document type, a script type, a type with parameters that are not a
+// charset, or nothing at all — is served as an opaque byte stream.
+const SERVED_CONTENT_TYPE = /^(image|video|audio|model)\/[\w.+-]+(?:;\s*charset=[\w-]+)?$/i;
+
+export function servedContentType(contentType: string | undefined): string {
+  const declared = contentType?.trim();
+  return declared && SERVED_CONTENT_TYPE.test(declared) ? declared : 'application/octet-stream';
 }
 
 export default class CacheManager extends EventEmitter {
@@ -254,12 +279,19 @@ export default class CacheManager extends EventEmitter {
       }
 
       const contentTypeHeader = cacheInfo.headers?.['content-type'];
-      const contentType =
-        (Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader) || 'application/octet-stream';
+      const contentType = servedContentType(
+        Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader,
+      );
 
       const responseHeaders: Record<string, string> = {
         'content-type': contentType,
         'accept-ranges': 'bytes',
+        // The bytes and their declared type both come from whoever served the
+        // NFT's file. They are only ever shown through <img>, <video> and
+        // <audio>, so a response that could be read as a document — and its
+        // scripts — is denied here as well as by the renderer's policy.
+        'x-content-type-options': 'nosniff',
+        'content-security-policy': "default-src 'none'; sandbox",
       };
 
       // Media elements seek by sending Range requests. Without 206 responses
@@ -296,22 +328,75 @@ export default class CacheManager extends EventEmitter {
     });
   }
 
+  // An fs error names the file it failed on, absolute path included, and the
+  // cache directory is somewhere under the user's home. Such a message stays
+  // in the main-process log; what crosses to the renderer, or is persisted
+  // in a sidecar it can read, says only what went wrong.
+  redactCachePath(error: unknown): Error {
+    const original = error instanceof Error ? error : new Error(String(error));
+    if (!original.message.includes(this.cacheDirectory)) {
+      return original;
+    }
+    log(`Cache file operation failed: ${original.message}`);
+    const { code } = original as { code?: string };
+    return new Error(`${code ?? 'EIO'}: cache file operation failed`);
+  }
+
   private prepareIPC() {
-    ipcMainHandle(CacheAPI.GET_CACHE_SIZE, () => this.getCacheSize());
-    ipcMainHandle(CacheAPI.CLEAR_CACHE, () => this.clearCache());
-    ipcMainHandle(CacheAPI.SET_CACHE_DIRECTORY, () => this.setCacheDirectory());
-    ipcMainHandle(CacheAPI.SET_MAX_CACHE_SIZE, (newSize: number) => this.setMaxCacheSize(newSize));
-    ipcMainHandle(CacheAPI.GET_CONTENT_WITH_INFO, (url: string, options?: CacheRequestOptions) =>
-      this.getContentWithInfo(url, options),
+    const guarded =
+      <Args extends unknown[], Result>(handler: (...args: Args) => Promise<Result> | Result) =>
+      async (...args: Args): Promise<Result> => {
+        try {
+          return await handler(...args);
+        } catch (error) {
+          throw this.redactCachePath(error);
+        }
+      };
+
+    ipcMainHandle(
+      CacheAPI.GET_CACHE_SIZE,
+      guarded(() => this.getCacheSize()),
     );
-    ipcMainHandle(CacheAPI.GET_CONTENT, (url: string, options?: CacheRequestOptions) => this.getContent(url, options));
-    ipcMainHandle(CacheAPI.GET_HEADERS, (url: string, options?: CacheRequestOptions) => this.getHeaders(url, options));
-    ipcMainHandle(CacheAPI.GET_CHECKSUM, (url: string, options?: CacheRequestOptions) =>
-      this.getChecksum(url, options),
+    ipcMainHandle(
+      CacheAPI.CLEAR_CACHE,
+      guarded(() => this.clearCache()),
     );
-    ipcMainHandle(CacheAPI.GET_URI, (url: string, options?: CacheRequestOptions) => this.getURI(url, options));
-    ipcMainHandle(CacheAPI.INVALIDATE, (url: string) => this.invalidate(url));
-    ipcMainHandle(CacheAPI.GET_CACHE_INFOS, (urls: string[]) => this.getCacheInfos(urls));
+    ipcMainHandle(
+      CacheAPI.SET_CACHE_DIRECTORY,
+      guarded(() => this.setCacheDirectory()),
+    );
+    ipcMainHandle(
+      CacheAPI.SET_MAX_CACHE_SIZE,
+      guarded((newSize: number) => this.setMaxCacheSize(newSize)),
+    );
+    ipcMainHandle(
+      CacheAPI.GET_CONTENT_WITH_INFO,
+      guarded((url: string, options?: CacheRequestOptions) => this.getContentWithInfo(url, options)),
+    );
+    ipcMainHandle(
+      CacheAPI.GET_CONTENT,
+      guarded((url: string, options?: CacheRequestOptions) => this.getContent(url, options)),
+    );
+    ipcMainHandle(
+      CacheAPI.GET_HEADERS,
+      guarded((url: string, options?: CacheRequestOptions) => this.getHeaders(url, options)),
+    );
+    ipcMainHandle(
+      CacheAPI.GET_CHECKSUM,
+      guarded((url: string, options?: CacheRequestOptions) => this.getChecksum(url, options)),
+    );
+    ipcMainHandle(
+      CacheAPI.GET_URI,
+      guarded((url: string, options?: CacheRequestOptions) => this.getURI(url, options)),
+    );
+    ipcMainHandle(
+      CacheAPI.INVALIDATE,
+      guarded((url: string) => this.invalidate(url)),
+    );
+    ipcMainHandle(
+      CacheAPI.GET_CACHE_INFOS,
+      guarded((urls: string[]) => this.getCacheInfos(urls)),
+    );
 
     ipcMainHandle(CacheAPI.GET_CACHE_DIRECTORY, () => this.cacheDirectory);
     ipcMainHandle(CacheAPI.GET_MAX_CACHE_SIZE, () => this.maxCacheSize);
@@ -481,6 +566,20 @@ export default class CacheManager extends EventEmitter {
         };
       }
 
+      // A sidecar that is not JSON is one this cache did not finish writing
+      // (a crash before the atomic rename existed, a disk error). Nothing in
+      // it can be trusted, and reporting it as an error would settle the
+      // entry for good; it is removed and the entry fetched afresh instead.
+      if (currentError instanceof SyntaxError) {
+        log(`Removing an unreadable cache info for ${url}`);
+        await safeUnlink(filePath);
+        return {
+          url,
+          state: CacheState.NOT_CACHED,
+          timestamp: Date.now(),
+        };
+      }
+
       // The full message of an fs error embeds the absolute path of the
       // sidecar — the user's home directory included — and this record is
       // handed to the renderer (getCacheInfos). The code says what went
@@ -510,7 +609,11 @@ export default class CacheManager extends EventEmitter {
       timestamp: Date.now(),
     };
 
-    await fs.writeFile(infoFilePath, JSON.stringify(cacheInfo), 'utf-8');
+    // Renamed into place so that a crash mid-write leaves either the previous
+    // sidecar or none, never a truncated one that would settle the entry.
+    const tempInfoFilePath = `${infoFilePath}${TEMP_FILE_SUFFIX}`;
+    await fs.writeFile(tempInfoFilePath, JSON.stringify(cacheInfo), 'utf-8');
+    await fs.rename(tempInfoFilePath, infoFilePath);
 
     return cacheInfo;
   }
@@ -555,7 +658,7 @@ export default class CacheManager extends EventEmitter {
         (retries < MAX_TRANSIENT_RETRIES && Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
     // A persisted size-limit error is only retried when the caller lifts
     // the limit, so oversized files are not re-downloaded on every visit.
-    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
+    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize > MAX_FILE_SIZE;
     // An ipfs failure is a verdict on one gateway, not on the resource:
     // once the user points the option at another gateway the entry is
     // re-requested right away, whatever the error was and however
@@ -579,7 +682,10 @@ export default class CacheManager extends EventEmitter {
     options: CacheRequestOptions = {},
     budget = { remaining: normalizeDownloadDuration(options.maxDuration) },
   ): Promise<CacheInfo> {
-    const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
+    // Both come from the renderer and reach a timer and a byte counter; see
+    // the normalizers for what an absent, invalid or "unlimited" value means.
+    const maxSize = normalizeMaxSize(options.maxSize);
+    const timeout = normalizeTimeout(options.timeout);
 
     // Validate before coalescing, reading sidecars, or queuing network work.
     if (!isValidURL(url)) {
@@ -800,8 +906,9 @@ export default class CacheManager extends EventEmitter {
           throw error;
         }
 
-        const currentError =
-          transferDeadline.error ?? (error as Error) ?? new Error('Unknown fetchRemoteContent error');
+        const currentError = this.redactCachePath(
+          transferDeadline.error ?? (error as Error) ?? new Error('Unknown fetchRemoteContent error'),
+        );
 
         const isTransient = isTransientDownloadError(currentError.message);
         if (isTransient) {
@@ -951,7 +1058,7 @@ export default class CacheManager extends EventEmitter {
         };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw error;
+          throw this.redactCachePath(error);
         }
       } finally {
         this.activeReads.delete(read);

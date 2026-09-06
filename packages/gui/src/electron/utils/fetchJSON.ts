@@ -2,6 +2,7 @@ import { net, IncomingMessage } from 'electron';
 
 import { toFetchableUrl } from './ipfsGateway';
 import isValidURL, { isValidRequestURL } from './isValidURL';
+import guardRedirects from './redirectPolicy';
 import getRequestUserAgent from './requestUserAgent';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
@@ -30,6 +31,8 @@ export default async function fetchJSON<TData>(
     method,
     url: requestUrl,
     headers,
+    // each redirect is checked against the same rule as the requested URL
+    redirect: 'manual',
   });
 
   request.setHeader('User-Agent', getRequestUserAgent());
@@ -113,6 +116,11 @@ export default async function fetchJSON<TData>(
 
     request.on('abort', () => {
       handleReject(new Error('Request aborted'));
+    });
+
+    guardRedirects(request, requestUrl, (error) => {
+      handleReject(error);
+      request.abort();
     });
 
     request.end();

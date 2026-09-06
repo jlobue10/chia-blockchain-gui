@@ -16,6 +16,7 @@ import { DEFAULT_DOWNLOAD_MAX_DURATION } from './DownloadDeadline';
 import fileExists from './fileExists';
 import { toFetchableUrl } from './ipfsGateway';
 import isValidURL, { isValidRequestURL } from './isValidURL';
+import guardRedirects from './redirectPolicy';
 import getRequestUserAgent from './requestUserAgent';
 
 const log = debug('chia-gui:downloadFile');
@@ -88,11 +89,39 @@ export { DEFAULT_DOWNLOAD_MAX_DURATION };
 // evicts and sweeps these files by the same suffix.
 export const TEMP_FILE_SUFFIX = '.tmp';
 
+// The default per-file cap, and the most any caller can ask for. A request
+// for "no limit" (any value at or below zero, the form the size-limit
+// override sends) gets the ceiling: a limit that is never enforced would let
+// a minter-controlled host fill the disk for the length of the deadline.
+export const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024;
+export const MAX_FILE_SIZE_CEILING = 2 * 1024 * 1024 * 1024;
+export const DEFAULT_INACTIVITY_TIMEOUT = 30_000;
+
+export function normalizeMaxSize(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_MAX_FILE_SIZE;
+  }
+  if (value <= 0 || value > MAX_FILE_SIZE_CEILING) {
+    return MAX_FILE_SIZE_CEILING;
+  }
+  return Math.floor(value);
+}
+
+// The inactivity timeout is clamped the way the transfer deadline is: a
+// value setTimeout cannot represent fires at once, and a non-number would be
+// treated the same, so both fall back to the default instead.
+export function normalizeTimeout(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_INACTIVITY_TIMEOUT;
+  }
+  return Math.max(1, Math.min(Math.floor(value), DEFAULT_DOWNLOAD_MAX_DURATION));
+}
+
 type DownloadFileOptions = {
   timeout?: number;
   maxDuration?: number; // absolute cap on the whole transfer
   signal?: AbortSignal;
-  maxSize?: number; // values <= 0 disable the size limit
+  maxSize?: number; // see normalizeMaxSize: values <= 0 mean the ceiling
   onProgress?: (progress: number, size: number, downloadedSize: number) => void;
   overrideFile?: boolean;
   // the gateway base an ipfs:// url is fetched through; defaults to the
@@ -110,10 +139,10 @@ export default async function downloadFile(
   url: string,
   localPath: string,
   {
-    timeout = 30_000,
+    timeout: requestedTimeout,
     maxDuration = DEFAULT_DOWNLOAD_MAX_DURATION,
     signal,
-    maxSize = 100 * 1024 * 1024,
+    maxSize: requestedMaxSize,
     onProgress,
     overrideFile = false,
     gatewayBase,
@@ -123,6 +152,9 @@ export default async function downloadFile(
   if (!isValidURL(url)) {
     throw new Error('Invalid URL');
   }
+
+  const maxSize = normalizeMaxSize(requestedMaxSize);
+  const timeout = normalizeTimeout(requestedTimeout);
 
   // A queued download can be aborted (invalidation, cache directory change)
   // before the concurrency limiter starts it. Without this check the transfer
@@ -145,7 +177,10 @@ export default async function downloadFile(
   }
 
   const tempFilePath = `${localPath}${TEMP_FILE_SUFFIX}`;
-  const request = net.request(fetchUrl);
+  // Redirects are followed one at a time, each checked against the same rule
+  // as the requested URL (see redirectPolicy), so a host cannot redirect the
+  // main process to a plain-http, loopback or private address.
+  const request = net.request({ url: fetchUrl, redirect: 'manual' });
   request.setHeader('User-Agent', getRequestUserAgent());
   const outputStream = new WriteStreamPromise(tempFilePath, overrideFile);
 
@@ -164,6 +199,8 @@ export default async function downloadFile(
     abortError = error;
     request.abort();
   }
+
+  guardRedirects(request, fetchUrl, abortWithError);
 
   let timeoutId: NodeJS.Timeout | null = null;
 
