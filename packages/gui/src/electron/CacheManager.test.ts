@@ -812,6 +812,43 @@ describe('CacheManager eviction', () => {
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
   });
 
+  it('records nothing when a caller whose shared budget is spent finds no cached entry', async () => {
+    const url = 'https://example.com/nft.png';
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    await expect(cacheManager.fetchRemoteContent(url, {}, { remaining: 0 })).rejects.toThrow(
+      'shared download deadline',
+    );
+    expect(mockDownloadFile).not.toHaveBeenCalled();
+    // the refusal is the caller's, not the url's: no sidecar, so a funded
+    // caller — and the next gateway — start from nothing
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info.state).toBe('NOT_CACHED');
+    expect(await fs.readdir(cacheDirectory)).toEqual([]);
+  });
+
+  it('hands a caller whose shared budget is spent the settled failure the cache holds', async () => {
+    const url = 'https://example.com/nft.png';
+    mockDownloadFile.mockRejectedValue(new Error('HTTP error: 404'));
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+    await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 404');
+
+    // a 404 is not retried, so the spent caller is told what the cache knows
+    await expect(cacheManager.fetchRemoteContent(url, {}, { remaining: 0 })).resolves.toMatchObject({
+      state: 'ERROR',
+      error: 'HTTP error: 404',
+    });
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
   it('does not fall back to the gateway once the host has used up the whole download deadline', async () => {
     const url = 'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
     let now = Date.now();

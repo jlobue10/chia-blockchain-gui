@@ -18,6 +18,7 @@ import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
 import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
+import SharedDownloadBudgetSpentError from './utils/SharedDownloadBudgetSpentError';
 import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
@@ -440,6 +441,54 @@ export default class CacheManager extends EventEmitter {
     }
   }
 
+  // Whether the persisted outcome for a url stands as it is — content that
+  // is cached, or a failure the retry rules say not to retry now — so that
+  // no transfer is called for. Shared by the transfer path and by callers
+  // whose allowance can afford no transfer.
+  private isSettledOutcome(cacheInfo: CacheInfo, url: string, maxSize: number): boolean {
+    if (cacheInfo.state === CacheState.CACHED) {
+      return true;
+    }
+    if (cacheInfo.state !== CacheState.ERROR) {
+      return false;
+    }
+
+    const isAbortError = ['Response aborted', 'Request aborted'].includes(cacheInfo.error);
+    // A persisted transient failure (timeout, 5xx, rate limit, bot
+    // challenge, network error) is retried once per session, and again
+    // within the session once its retry delay has elapsed — a one-off
+    // gateway problem must not disable the preview until the whole
+    // cache is cleared. The delay grows with every consecutive failure
+    // and the in-session retries stop after MAX_TRANSIENT_RETRIES, so
+    // a host that never recovers is not re-probed every ten minutes for
+    // the life of the process. Sidecars written without a timestamp
+    // fall back to the once-per-session rule.
+    const retries = cacheInfo.retries ?? 0;
+    const isRetriableTransientError =
+      isTransientDownloadError(cacheInfo.error) &&
+      (!this.transientFailureUrls.has(url) ||
+        (retries < MAX_TRANSIENT_RETRIES && Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
+    // A persisted size-limit error is only retried when the caller lifts
+    // the limit, so oversized files are not re-downloaded on every visit.
+    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
+    // An ipfs failure is a verdict on one gateway, not on the resource:
+    // once the user points the option at another gateway the entry is
+    // re-requested right away, whatever the error was and however
+    // recently it was recorded. Only while the option is on, since with
+    // it off there is no gateway to retry through and the refusal would
+    // never settle. A sidecar that names its gateway is compared with
+    // the current one; an https gateway link without a recorded gateway
+    // failed without ever getting the fallback (the option was off, or
+    // the sidecar predates it), so it gets one now — the attempt records
+    // the gateway and settles it. An ipfs:// sidecar without a gateway
+    // predates gateway tracking and follows the transient-error rules.
+    const isGatewayChanged =
+      isIpfsBackedUrl(url) &&
+      ipfsGatewayEnabled() &&
+      (cacheInfo.gateway === undefined ? !isIpfsUrl(url) : cacheInfo.gateway !== ipfsGatewayBase());
+    return !isAbortError && !isRetriableTransientError && !isSizeLimitLifted && !isGatewayChanged;
+  }
+
   async fetchRemoteContent(
     url: string,
     options: CacheRequestOptions = {},
@@ -453,10 +502,8 @@ export default class CacheManager extends EventEmitter {
     }
 
     // What is left of the caller's allowance bounds any transfer it starts or
-    // joins. A spent allowance still reads the cache: content that is already
-    // there costs nothing to serve, and a recheck after a join or a
-    // maintenance wait commonly finds exactly that. The floor only matters
-    // to a transfer that is refused before it starts (below).
+    // joins. The floor is never reached: a spent allowance is turned away
+    // below before it could start or join one.
     const maxDuration = Math.max(1, Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining));
 
     // Recheck after each await: another maintenance operation may have been
@@ -465,6 +512,26 @@ export default class CacheManager extends EventEmitter {
     while (this.maintenance) {
       // eslint-disable-next-line no-await-in-loop -- Serialize admission against maintenance.
       await this.maintenance.catch(() => {});
+    }
+
+    // A spent allowance still reads the cache — content that is already
+    // there costs nothing to serve, and a recheck after a join or a
+    // maintenance wait commonly finds exactly that — but it buys no transfer:
+    // not a seat on another caller's (joining would tighten that transfer's
+    // deadline to the floor and abort a healthy download someone else is
+    // waiting on) and none of its own. Decided here, before this caller could
+    // register as the url's owner: a refusal raised from inside the transfer
+    // would be caught below and persisted as a transient error against the
+    // current gateway — a verdict on nothing — and inherited by every caller
+    // that joined in the meantime. Nothing is written on this path.
+    if (budget.remaining <= 0) {
+      if (!this.ongoingRequests.has(url)) {
+        const cacheInfo = await this.getCacheInfoByURL(url);
+        if (this.isSettledOutcome(cacheInfo, url, maxSize)) {
+          return cacheInfo;
+        }
+      }
+      throw new SharedDownloadBudgetSpentError();
     }
 
     // Captured once, up front, and pinned for the download itself (which may
@@ -493,15 +560,6 @@ export default class CacheManager extends EventEmitter {
 
     const ongoingRequest = this.ongoingRequests.get(url);
     if (ongoingRequest) {
-      // A spent allowance buys no seat on another caller's transfer: joining
-      // would tighten that transfer's deadline to the floor and abort a
-      // healthy download someone else is waiting on, recording a deadline
-      // error against the url on their behalf. Refuse instead, and persist
-      // nothing: the cache knows no more about the url than it did.
-      if (budget.remaining <= 0) {
-        throw new Error('Request exceeded the shared download deadline');
-      }
-
       log('Request already ongoing', url);
       ongoingRequest.deadline.constrain(maxDuration);
 
@@ -557,42 +615,7 @@ export default class CacheManager extends EventEmitter {
 
         if (cacheInfo.state === CacheState.ERROR) {
           log(`Url already downloaded with error: ${cacheInfo.error}`, url);
-
-          const isAbortError = ['Response aborted', 'Request aborted'].includes(cacheInfo.error);
-          // A persisted transient failure (timeout, 5xx, rate limit, bot
-          // challenge, network error) is retried once per session, and again
-          // within the session once its retry delay has elapsed — a one-off
-          // gateway problem must not disable the preview until the whole
-          // cache is cleared. The delay grows with every consecutive failure
-          // and the in-session retries stop after MAX_TRANSIENT_RETRIES, so
-          // a host that never recovers is not re-probed every ten minutes for
-          // the life of the process. Sidecars written without a timestamp
-          // fall back to the once-per-session rule.
-          const retries = cacheInfo.retries ?? 0;
-          const isRetriableTransientError =
-            isTransientDownloadError(cacheInfo.error) &&
-            (!this.transientFailureUrls.has(url) ||
-              (retries < MAX_TRANSIENT_RETRIES &&
-                Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
-          // A persisted size-limit error is only retried when the caller lifts
-          // the limit, so oversized files are not re-downloaded on every visit.
-          const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
-          // An ipfs failure is a verdict on one gateway, not on the resource:
-          // once the user points the option at another gateway the entry is
-          // re-requested right away, whatever the error was and however
-          // recently it was recorded. Only while the option is on, since with
-          // it off there is no gateway to retry through and the refusal would
-          // never settle. A sidecar that names its gateway is compared with
-          // the current one; an https gateway link without a recorded gateway
-          // failed without ever getting the fallback (the option was off, or
-          // the sidecar predates it), so it gets one now — the attempt records
-          // the gateway and settles it. An ipfs:// sidecar without a gateway
-          // predates gateway tracking and follows the transient-error rules.
-          const isGatewayChanged =
-            isIpfsBackedUrl(url) &&
-            ipfsGatewayEnabled() &&
-            (cacheInfo.gateway === undefined ? !isIpfsUrl(url) : cacheInfo.gateway !== ipfsGatewayBase());
-          if (!isAbortError && !isRetriableTransientError && !isSizeLimitLifted && !isGatewayChanged) {
+          if (this.isSettledOutcome(cacheInfo, url, maxSize)) {
             return cacheInfo;
           }
 
@@ -605,7 +628,7 @@ export default class CacheManager extends EventEmitter {
           // One active-transfer deadline covers the original host and fallback.
           // Queue wait consumes no allowance; coalesced callers can tighten it.
           if (budget.remaining <= 0) {
-            throw new Error('Request exceeded the shared download deadline');
+            throw new SharedDownloadBudgetSpentError();
           }
           transferDeadline.start();
           const downloadOptions = {
@@ -688,7 +711,7 @@ export default class CacheManager extends EventEmitter {
         // starts. Persisting that as a cache error would keep the entry
         // poisoned after the user turns the option on, so it propagates
         // instead — already-cached content was served above regardless.
-        if (error instanceof IpfsGatewayDisabledError) {
+        if (error instanceof IpfsGatewayDisabledError || error instanceof SharedDownloadBudgetSpentError) {
           throw error;
         }
 
