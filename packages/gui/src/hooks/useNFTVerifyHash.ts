@@ -23,9 +23,15 @@ export type UseNFTVerifyHashOptions = {
   excludedPreviewUris?: string[];
 };
 
+// This runs while rendering; a uri list that is not one (metadata is
+// minter-authored, and normalized on parse, but not every caller's copy has
+// been) is treated as none rather than allowed to throw here.
 function withoutExcluded(uris: string[] | undefined, excluded: Set<string>): string[] | undefined {
-  if (!uris || excluded.size === 0) {
-    return uris?.slice(0, MAX_URIS_PER_CANDIDATE);
+  if (!Array.isArray(uris)) {
+    return undefined;
+  }
+  if (excluded.size === 0) {
+    return uris.slice(0, MAX_URIS_PER_CANDIDATE);
   }
 
   return uris.slice(0, MAX_URIS_PER_CANDIDATE).filter((uri) => !excluded.has(uri));

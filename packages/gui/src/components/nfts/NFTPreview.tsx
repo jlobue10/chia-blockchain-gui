@@ -11,6 +11,7 @@ import {
 import { t, Trans } from '@lingui/macro';
 import { Loop as LoopIcon, NotInterested } from '@mui/icons-material';
 import { alpha, Box, IconButton, Tooltip } from '@mui/material';
+import debug from 'debug';
 import React, { useMemo, useRef, Fragment, useCallback, useEffect, type ReactNode } from 'react';
 import styled from 'styled-components';
 
@@ -109,6 +110,8 @@ const CompactExtension = styled.div`
   color: ${({ theme }) => theme.palette.primary.main};
 `;
 
+const log = debug('chia-gui:NFTPreview');
+
 export type NFTPreviewProps = {
   id: string;
   width?: number | string;
@@ -123,7 +126,45 @@ export type NFTPreviewProps = {
   hideStatus?: boolean;
 };
 
+// One tile's failure stays that tile's. Whatever an NFT's files or metadata
+// hold, a render error here is shown in place of the preview; without this
+// the nearest boundary is the one around the whole app, and one NFT in the
+// wallet would replace the gallery with the crash page on every load.
+class NFTPreviewErrorBoundary extends React.Component<{ children: ReactNode }, { failed: boolean }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error) {
+    log(`NFT preview failed to render: ${error.message}`);
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <IconMessage icon={<NotInterested fontSize="large" />}>
+          <Trans>Preview cannot be shown</Trans>
+        </IconMessage>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function NFTPreview(props: NFTPreviewProps) {
+  return (
+    <NFTPreviewErrorBoundary>
+      <NFTPreviewContent {...props} />
+    </NFTPreviewErrorBoundary>
+  );
+}
+
+function NFTPreviewContent(props: NFTPreviewProps) {
   const [nftImageFittingMode] = useNFTImageFittingMode();
   const {
     id,
@@ -356,8 +397,13 @@ export default function NFTPreview(props: NFTPreviewProps) {
 
   useEffect(() => {
     abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
-    preparePreview(abortControllerRef.current.signal);
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    preparePreview(abortController.signal);
+    // A tile that scrolls away mid-preparation lets go of its probe slot and
+    // its pending state updates, instead of holding one of the few probe
+    // slots until the probe's own timeout.
+    return () => abortController.abort();
   }, [preparePreview]);
 
   const previewCompactIcon = useMemo(() => {
