@@ -4,23 +4,23 @@ import isValidURL from './isValidURL';
 
 // Redirect targets are chosen by whoever answers the request: for an NFT
 // resource that is the minter's host, or a gateway relaying its content. A
-// redirect is therefore held to the rule the requested URL had to meet —
-// https, to a host the structural check accepts — and to one more: a
-// redirect names a host the NFT never did, so it may not point at this
-// machine or the local network, whatever the scheme, although a minter's
-// own https URI to such an address would be accepted as recorded. The one
-// exception is a request that already went to a gateway on this machine (a
-// local IPFS node, http or https): it may redirect within its own origin, as
-// such nodes do to canonicalize a path, and nowhere else.
+// redirect that stays on the origin the request went to names no new host
+// and is always followed: that origin was already accepted, as an NFT URI or
+// as the configured gateway, and a gateway on this machine or the local
+// network canonicalizes paths this way. A redirect elsewhere is held to the
+// rule the requested URL had to meet — https, to a host the structural check
+// accepts — and to one more: it may not point at this machine or the local
+// network, whatever the scheme, because it names a host the NFT never did,
+// although a minter's own https URI to such an address is accepted as
+// recorded.
 export const MAX_REDIRECTS = 5;
 export const REDIRECT_REFUSED_ERROR = 'Redirect refused';
 export const TOO_MANY_REDIRECTS_ERROR = 'Too many redirects';
 
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
-
-function isLoopbackOrigin(parsed: URL): boolean {
-  return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && LOOPBACK_HOSTS.has(parsed.hostname);
-}
+// Names that resolve on this machine or its network by convention:
+// localhost, mDNS (.local), the home-network zone, and the reserved
+// private-use domain.
+const LOCAL_NAME_SUFFIXES = ['.localhost', '.local', '.home.arpa', '.internal'];
 
 // Whether a host names this machine or a network no NFT resource lives on:
 // loopback, link-local, the private ranges, the unspecified and shared
@@ -41,8 +41,8 @@ function isPrivateIpv4(octets: number[]): boolean {
 }
 
 export function isLocalOrPrivateHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-  if (host === 'localhost' || host.endsWith('.localhost')) {
+  const host = hostname.toLowerCase().replace(/\.$/, '');
+  if (host === 'localhost' || LOCAL_NAME_SUFFIXES.some((suffix) => host.endsWith(suffix))) {
     return true;
   }
 
@@ -93,8 +93,8 @@ export function isAllowedRedirect(fromUrl: string, toUrl: string): boolean {
     return false;
   }
 
-  // a local gateway may canonicalize within its own origin
-  if (isLoopbackOrigin(from) && to.origin === from.origin) {
+  // same origin: no new host, whatever the host is
+  if (to.origin === from.origin && to.origin !== 'null') {
     return true;
   }
 
