@@ -103,20 +103,20 @@ This is appended to #3062's existing head without rebasing or rewriting it.
 `CacheManager` and `downloadFile` overlap #3066/#3068; they are not assumed to
 merge as an already-tested combined tree.
 
-* With #3066, preserve gateway pinning, retry counters/classification and the
+- With #3066, preserve gateway pinning, retry counters/classification and the
   original/fallback shared deadline. Use the remaining `transferDeadline`
   duration for the original request **and** its fallback, not a new 30-minute
   allowance. Tighten an ongoing request before waiting for an old gateway's
   result. Retain one shared default-duration definition/import, not duplicate
   declarations introduced while resolving the overlap.
-* With #3068, retain the maintenance wait **before registering new work**,
+- With #3068, retain the maintenance wait **before registering new work**,
   maintenance serialization and per-request identity cleanup. Both changes
   declare `maintenance`; retain one declaration. The new bundle read waits on
   that same barrier before reading the final destination. The independent
   #3062 branch leaves the barrier unset until the maintenance implementation
   is integrated. The focused test injects the barrier to exercise this read
   contract, not the complete migration operation.
-* Preserve #3067's bounded cache-info lookup and #3062's existing NFT refresh
+- Preserve #3067's bounded cache-info lookup and #3062's existing NFT refresh
   reset/invalidation ordering.
 
 Run the full combined suite after resolving overlaps. Focused success does not
