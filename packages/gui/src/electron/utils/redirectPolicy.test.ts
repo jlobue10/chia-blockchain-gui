@@ -12,9 +12,14 @@ describe('isAllowedRedirect', () => {
       'http://127.0.0.1:8080/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/',
     ],
     ['http://localhost:8080/ipfs/x', 'http://localhost:8080/ipfs/x/'],
-    // ... over https as well
+    // ... over https as well, and from a gateway on the local network or an
+    // NFT host on a private address: same origin is never a new host
     ['https://localhost:8443/ipfs/x', 'https://localhost:8443/ipfs/x/'],
     ['https://127.0.0.1:8443/ipfs/x', 'https://127.0.0.1:8443/ipfs/y'],
+    ['https://192.168.1.10/ipfs/x', 'https://192.168.1.10/ipfs/x/'],
+    ['https://[fd00::1]/ipfs/x', 'https://[fd00::1]/ipfs/x/'],
+    ['https://nas.local/ipfs/x', 'https://nas.local/ipfs/x/'],
+    ['https://minter.example/a', 'https://minter.example/b'],
   ])('allows %s -> %s', (from, to) => {
     expect(isAllowedRedirect(from, to)).toBe(true);
   });
@@ -48,12 +53,18 @@ describe('isAllowedRedirect', () => {
     ['https://minter.example/a.png', 'https://192.168.1.1/'],
     ['https://minter.example/a.png', 'https://100.64.0.1/'],
     ['https://minter.example/a.png', 'https://0.0.0.0/'],
+    // names that resolve on this machine or its network by convention
+    ['https://minter.example/a.png', 'https://router.local/'],
+    ['https://minter.example/a.png', 'https://nas.local./'],
+    ['https://minter.example/a.png', 'https://printer.home.arpa/'],
+    ['https://minter.example/a.png', 'https://vault.internal/'],
     // a local gateway may not send the request anywhere else
     ['http://127.0.0.1:8080/ipfs/x', 'http://127.0.0.1:9090/ipfs/x'],
     ['http://127.0.0.1:8080/ipfs/x', 'http://localhost:8080/ipfs/x'],
     ['http://127.0.0.1:8080/ipfs/x', 'http://192.168.1.1/ipfs/x'],
     ['https://localhost:8443/ipfs/x', 'https://localhost:9443/ipfs/x'],
     ['https://localhost:8443/ipfs/x', 'https://127.0.0.1:8443/ipfs/x'],
+    ['https://192.168.1.10/ipfs/x', 'https://192.168.1.11/ipfs/x'],
     // garbage
     ['https://minter.example/a.png', 'not a url'],
     ['https://minter.example/a.png', ''],
@@ -124,6 +135,11 @@ describe('isLocalOrPrivateHost', () => {
     '[::ffff:10.0.0.1]',
     '[::ffff:7f00:1]',
     '[::ffff:a00:1]',
+    'router.local',
+    'nas.LOCAL',
+    'nas.local.',
+    'printer.home.arpa',
+    'vault.internal',
   ])('%s is local or private', (host) => {
     expect(isLocalOrPrivateHost(host)).toBe(true);
   });
@@ -139,6 +155,8 @@ describe('isLocalOrPrivateHost', () => {
     '[2606:4700::1111]',
     'localhost.evil.com',
     '127.0.0.1.evil.com',
+    'local.example.com',
+    'internal.example.com',
   ])('%s is not', (host) => {
     expect(isLocalOrPrivateHost(host)).toBe(false);
   });
