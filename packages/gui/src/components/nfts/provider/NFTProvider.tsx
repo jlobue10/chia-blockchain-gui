@@ -181,15 +181,17 @@ export default function NFTProvider(props: NFTProviderProps) {
           // invalidate all previews
           const { preview_video_uris: previewVideoUris, preview_image_uris: previewImageUris } = metadata;
 
-          if (previewVideoUris) {
-            previewVideoUris.forEach((uri: string) => promises.push(invalidate(uri)));
-            invalidatedUris.push(...previewVideoUris);
-          }
-
-          if (previewImageUris) {
-            previewImageUris.forEach((uri: string) => promises.push(invalidate(uri)));
-            invalidatedUris.push(...previewImageUris);
-          }
+          // Appended one by one: these arrays come from the NFT's metadata and
+          // can be as long as its author likes, and `push(...uris)` passes
+          // every element as an argument — past V8's argument limit that
+          // throws, and the catch below would swallow it, leaving the refresh
+          // the user asked for half done.
+          [previewVideoUris, previewImageUris].forEach((uris) => {
+            uris?.forEach((uri: string) => {
+              promises.push(invalidate(uri));
+              invalidatedUris.push(uri);
+            });
+          });
         }
       } catch (e) {
         log(`Error loading metadata for ${id}: ${(e as Error).message}`);
