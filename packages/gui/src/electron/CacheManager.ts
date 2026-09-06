@@ -10,16 +10,23 @@ import debug from 'debug';
 
 import type CacheInfo from '../@types/CacheInfo';
 import type CacheInfoBase from '../@types/CacheInfoBase';
+import type { CacheContent, CacheRequestOptions } from '../@types/CacheService';
 import type Headers from '../@types/Headers';
 import CacheState from '../constants/CacheState';
+import ipfsToGatewayUrl, { getGatewayHost, getIpfsPathFromGatewayUrl, isIpfsBackedUrl, isIpfsUrl } from '../util/ipfs';
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
-import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isDownloadTimeoutError } from './utils/downloadFile';
+import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
+import downloadFile, {
+  MAX_FILE_SIZE_EXCEEDED_ERROR,
+  TEMP_FILE_SUFFIX,
+  isTransientDownloadError,
+} from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
-import { IpfsGatewayDisabledError } from './utils/ipfsGateway';
+import { IpfsGatewayDisabledError, ipfsGatewayBase, ipfsGatewayEnabled } from './utils/ipfsGateway';
 import isValidURL from './utils/isValidURL';
 import sanitizeFilename from './utils/sanitizeFilename';
 import sanitizeNumber from './utils/sanitizeNumber';
@@ -85,7 +92,41 @@ const FILE_SUFFIX = '-chiacache';
 const MAX_TOTAL_SIZE = 1024 * 1024 * 1024; // 1GB
 const MAX_FILE_SIZE = 1024 * 1024 * 100; // 100MB
 
-const SUFFIXES = [FILE_SUFFIX, `${FILE_SUFFIX}${INFO_SUFFIX}`];
+// How long a persisted transient download failure (timeout, gateway error,
+// rate limit, bot challenge) settles before the next access retries it. Long
+// enough that a stalled host is not re-probed on every tile mount, short
+// enough that a gateway hiccup does not blank an NFT until the GUI restarts.
+export const TRANSIENT_ERROR_RETRY_DELAY = 10 * 60 * 1000; // 10 minutes
+
+// The delay doubles with every consecutive transient failure, up to this
+// ceiling, and after MAX_TRANSIENT_RETRIES failures in a row the entry settles
+// for good (until the NFT is refreshed or the cache cleared). Every URL here
+// is minter-authored, so a retry schedule must have a bound: with a fixed
+// delay a host that answers 503 forever would be re-probed every ten minutes
+// for as long as the wallet is open — a liveness beacon for whoever runs it.
+export const MAX_TRANSIENT_ERROR_RETRY_DELAY = 24 * 60 * 60 * 1000; // 1 day
+export const MAX_TRANSIENT_RETRIES = 8;
+
+// The wait before the next in-session retry of a URL that has failed
+// transiently `retries` times in a row: 10 min, 20 min, 40 min, ...
+export function transientErrorRetryDelay(retries: number): number {
+  const exponent = Math.max(0, Math.min(retries - 1, 31));
+  return Math.min(TRANSIENT_ERROR_RETRY_DELAY * 2 ** exponent, MAX_TRANSIENT_ERROR_RETRY_DELAY);
+}
+
+// Bounds on one getCacheInfos call (see there). The renderer's sweep asks for
+// at most 500 urls at a time; the cap leaves headroom for that and refuses
+// anything that could only come from somewhere else.
+export const MAX_CACHE_INFO_LOOKUPS = 1000;
+const CACHE_INFO_LOOKUP_CONCURRENCY = 16;
+
+// Every file the cache owns: the data file, its `-info` sidecar, and the
+// `.tmp` file a download streams into before it is renamed into place. The
+// temp files count too — an interrupted download (quit, crash, a failed
+// cleanup) leaves one behind, and a file the size accounting, eviction and
+// "Clear cache" cannot see would grow the directory past the user's limit
+// with no way to reclaim it from the UI.
+const SUFFIXES = [FILE_SUFFIX, `${FILE_SUFFIX}${INFO_SUFFIX}`, `${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`];
 
 function isChiaCacheFile(filePath: string) {
   return SUFFIXES.some((suffix) => filePath.endsWith(suffix));
@@ -95,8 +136,23 @@ function isChiaCacheInfoFile(filePath: string) {
   return isChiaCacheFile(filePath) && filePath.endsWith(INFO_SUFFIX);
 }
 
+function isChiaCacheTempFile(filePath: string) {
+  return filePath.endsWith(`${FILE_SUFFIX}${TEMP_FILE_SUFFIX}`);
+}
+
 function getInfoFilePath(filePath: string) {
   return `${filePath}${INFO_SUFFIX}`;
+}
+
+// Whether a sidecar claims its data file is present. An unreadable sidecar is
+// left alone: the lookup path reports it on its own terms.
+async function isCachedSidecar(infoFilePath: string): Promise<boolean> {
+  try {
+    const info = JSON.parse(await fs.readFile(infoFilePath, 'utf-8')) as Partial<CacheInfo>;
+    return info.state === CacheState.CACHED;
+  } catch {
+    return false;
+  }
 }
 
 export default class CacheManager extends EventEmitter {
@@ -111,13 +167,30 @@ export default class CacheManager extends EventEmitter {
     {
       promise: Promise<CacheInfo>;
       abort: () => void;
+      // for ipfs:// URLs: the gateway base the request was started through
+      gateway?: string;
+      deadline: DownloadDeadline;
     }
   > = new Map();
 
-  // URLs whose download timed out during this session. A persisted timeout is
-  // retried once per session — the set keeps a stalled host from being retried
-  // (and holding a download slot) on every access within the same session.
-  private timedOutUrls: Set<string> = new Set();
+  // URLs whose download failed transiently during this session. A persisted
+  // transient failure is retried once per session and again whenever the retry
+  // delay has elapsed since it was recorded — the set keeps a stalled or
+  // challenging host from being retried (and holding a download slot) on every
+  // access in between.
+  private transientFailureUrls: Set<string> = new Set();
+
+  // Clear, migration and invalidation share one barrier. Waiters must not enter
+  // the request map until admitted: maintenance drains that map, so a request
+  // which itself awaits maintenance would create a circular wait.
+  private maintenance: Promise<void> | undefined;
+
+  private clearing: Promise<void> | undefined;
+
+  private maintenanceGeneration = 0;
+
+  // Only disk reads enter this map; they never wait for maintenance or fetches.
+  private activeReads = new Map<Promise<Buffer>, { url: string; filePath: string }>();
 
   constructor(
     options: {
@@ -227,18 +300,15 @@ export default class CacheManager extends EventEmitter {
     ipcMainHandle(CacheAPI.CLEAR_CACHE, () => this.clearCache());
     ipcMainHandle(CacheAPI.SET_CACHE_DIRECTORY, () => this.setCacheDirectory());
     ipcMainHandle(CacheAPI.SET_MAX_CACHE_SIZE, (newSize: number) => this.setMaxCacheSize(newSize));
-    ipcMainHandle(CacheAPI.GET_CONTENT, (url: string, options?: { maxSize?: number; timeout?: number }) =>
-      this.getContent(url, options),
+    ipcMainHandle(CacheAPI.GET_CONTENT_WITH_INFO, (url: string, options?: CacheRequestOptions) =>
+      this.getContentWithInfo(url, options),
     );
-    ipcMainHandle(CacheAPI.GET_HEADERS, (url: string, options?: { maxSize?: number; timeout?: number }) =>
-      this.getHeaders(url, options),
-    );
-    ipcMainHandle(CacheAPI.GET_CHECKSUM, (url: string, options?: { maxSize?: number; timeout?: number }) =>
+    ipcMainHandle(CacheAPI.GET_CONTENT, (url: string, options?: CacheRequestOptions) => this.getContent(url, options));
+    ipcMainHandle(CacheAPI.GET_HEADERS, (url: string, options?: CacheRequestOptions) => this.getHeaders(url, options));
+    ipcMainHandle(CacheAPI.GET_CHECKSUM, (url: string, options?: CacheRequestOptions) =>
       this.getChecksum(url, options),
     );
-    ipcMainHandle(CacheAPI.GET_URI, (url: string, options?: { maxSize?: number; timeout?: number }) =>
-      this.getURI(url, options),
-    );
+    ipcMainHandle(CacheAPI.GET_URI, (url: string, options?: CacheRequestOptions) => this.getURI(url, options));
     ipcMainHandle(CacheAPI.INVALIDATE, (url: string) => this.invalidate(url));
     ipcMainHandle(CacheAPI.GET_CACHE_INFOS, (urls: string[]) => this.getCacheInfos(urls));
 
@@ -317,6 +387,44 @@ export default class CacheManager extends EventEmitter {
 
   async init() {
     await ensureDirectoryExists(this.cacheDirectory);
+    await this.removeStaleTempFiles();
+  }
+
+  // Deletes the temp files of downloads that are not in flight. At startup
+  // that is every temp file: none can belong to a live download. Errors are
+  // ignored — a file that cannot be removed is still counted and evictable.
+  private async removeStaleTempFiles() {
+    let files: string[];
+    try {
+      files = await fs.readdir(this.cacheDirectory);
+    } catch (error) {
+      log(`Could not list the cache directory for stale temp files: ${(error as Error).message}`);
+      return;
+    }
+
+    const inFlight = this.inFlightTempFilePaths();
+    await Promise.all(
+      files
+        .filter((file) => isChiaCacheTempFile(file))
+        .map((file) => path.join(this.cacheDirectory, file))
+        .filter((filePath) => !inFlight.has(filePath))
+        .map((filePath) => safeUnlink(filePath)),
+    );
+  }
+
+  // The temp files that downloads currently in flight are writing to. Their
+  // urls are the ongoing requests; a temp file that is not one of these is a
+  // leftover no download will ever finish.
+  private inFlightTempFilePaths(): Set<string> {
+    const paths = new Set<string>();
+    this.ongoingRequests.forEach((_request, url) => {
+      try {
+        paths.add(`${this.getCacheFilePath(url)}${TEMP_FILE_SUFFIX}`);
+      } catch {
+        // a url the cache cannot key has no file
+      }
+    });
+    return paths;
   }
 
   public get maxCacheSize(): number {
@@ -363,7 +471,8 @@ export default class CacheManager extends EventEmitter {
       return JSON.parse(infoString) as CacheInfo;
     } catch (error) {
       const currentError = (error as Error) ?? new Error('Unknown error');
-      if ((currentError as { code?: string }).code === 'ENOENT') {
+      const { code } = currentError as { code?: string };
+      if (code === 'ENOENT') {
         return {
           url,
           state: CacheState.NOT_CACHED,
@@ -371,10 +480,15 @@ export default class CacheManager extends EventEmitter {
         };
       }
 
+      // The full message of an fs error embeds the absolute path of the
+      // sidecar — the user's home directory included — and this record is
+      // handed to the renderer (getCacheInfos). The code says what went
+      // wrong; the path stays in the main process log.
+      log(`Could not read the cache info for ${url}: ${currentError.message}`);
       return {
         url,
         state: CacheState.ERROR,
-        error: currentError.message,
+        error: code ?? 'Cache info unreadable',
         timestamp: Date.now(),
       };
     }
@@ -413,24 +527,83 @@ export default class CacheManager extends EventEmitter {
 
   async fetchRemoteContent(
     url: string,
-    options: {
-      maxSize?: number;
-      timeout?: number;
-    } = {},
+    options: CacheRequestOptions = {},
+    budget = { remaining: normalizeDownloadDuration(options.maxDuration) },
   ): Promise<CacheInfo> {
     const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
+    // Validate before coalescing, reading sidecars, or queuing network work.
+    const maxDuration = Math.max(1, Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining));
 
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
 
+    // Recheck after each await: another maintenance operation may have been
+    // queued while this caller waited. No await separates the last check from
+    // registration below, so every request is either admitted or held back.
+    while (this.maintenance) {
+      // eslint-disable-next-line no-await-in-loop -- Serialize admission against maintenance.
+      await this.maintenance.catch(() => {});
+    }
+
+    // Captured once, up front, and pinned for the download itself (which may
+    // wait in the queue while the user changes the preference): the gateway a
+    // request goes through is part of its outcome, so a failure must be
+    // recorded against the gateway the request actually used. This covers
+    // ipfs:// URIs and https gateway URLs alike — the latter fall back to the
+    // configured gateway when their own host fails (see below), but only
+    // while the option is on, so with it off a gateway link's failure is a
+    // verdict on its own host alone and records no gateway; turning the
+    // option on then gives the link its first fallback (isGatewayChanged).
+    const requestGateway =
+      isIpfsUrl(url) || (isIpfsBackedUrl(url) && ipfsGatewayEnabled()) ? ipfsGatewayBase() : undefined;
+
+    // Charge actual admitted work, including a joined transfer, exactly once
+    // per fetch decision. Rechecks after maintenance/gateway changes share this
+    // budget instead of receiving another full metadata allowance.
+    const consume = async (request: { promise: Promise<CacheInfo>; deadline: DownloadDeadline }) => {
+      try {
+        return await request.promise;
+      } finally {
+        // eslint-disable-next-line no-param-reassign -- Rechecks consume the caller's shared allowance.
+        budget.remaining = Math.max(0, budget.remaining - request.deadline.elapsed());
+      }
+    };
+
     const ongoingRequest = this.ongoingRequests.get(url);
     if (ongoingRequest) {
       log('Request already ongoing', url);
-      return ongoingRequest.promise;
+      ongoingRequest.deadline.constrain(maxDuration);
+
+      if (ongoingRequest.gateway !== requestGateway) {
+        // The in-flight request went through a gateway the user has since
+        // moved away from, so its outcome is a verdict on that gateway only.
+        // Wait for it, then look again: a success is served from the cache,
+        // a failure — recorded under the old gateway — is retried through
+        // the current one by the gateway check below. Without this the
+        // caller would inherit the old gateway's error until the retry delay
+        // elapsed.
+        const lookAgain = () => this.fetchRemoteContent(url, options, budget);
+        return consume(ongoingRequest).then(lookAgain, lookAgain);
+      }
+
+      return consume(ongoingRequest);
     }
 
     const abortController = new AbortController();
+    const transferDeadline = new DownloadDeadline(maxDuration, () => abortController.abort());
+    let ongoingRequestEntry:
+      | {
+          promise: Promise<CacheInfo>;
+          abort: () => void;
+          deadline: DownloadDeadline;
+          gateway?: string;
+        }
+      | undefined;
+
+    // the persisted outcome this attempt is retrying, if any — a transient
+    // failure recorded on top of an earlier one continues its retry count
+    let previousCacheInfo: CacheInfo | undefined;
 
     const process = async (): Promise<CacheInfo> => {
       try {
@@ -446,6 +619,7 @@ export default class CacheManager extends EventEmitter {
         }
 
         const cacheInfo = await this.getCacheInfoByURL(url);
+        previousCacheInfo = cacheInfo;
         if (cacheInfo.state === CacheState.CACHED) {
           log('Url already downloaded', url);
           return cacheInfo;
@@ -454,15 +628,41 @@ export default class CacheManager extends EventEmitter {
         if (cacheInfo.state === CacheState.ERROR) {
           log(`Url already downloaded with error: ${cacheInfo.error}`, url);
 
-          const isTransientError = ['Response aborted', 'Request aborted'].includes(cacheInfo.error);
-          // A persisted timeout settles for the rest of the session, but is
-          // retried in later sessions — a one-off network problem must not
-          // disable the preview until the whole cache is cleared.
-          const isRetriableTimeout = isDownloadTimeoutError(cacheInfo.error) && !this.timedOutUrls.has(url);
+          const isAbortError = ['Response aborted', 'Request aborted'].includes(cacheInfo.error);
+          // A persisted transient failure (timeout, 5xx, rate limit, bot
+          // challenge, network error) is retried once per session, and again
+          // within the session once its retry delay has elapsed — a one-off
+          // gateway problem must not disable the preview until the whole
+          // cache is cleared. The delay grows with every consecutive failure
+          // and the in-session retries stop after MAX_TRANSIENT_RETRIES, so
+          // a host that never recovers is not re-probed every ten minutes for
+          // the life of the process. Sidecars written without a timestamp
+          // fall back to the once-per-session rule.
+          const retries = cacheInfo.retries ?? 0;
+          const isRetriableTransientError =
+            isTransientDownloadError(cacheInfo.error) &&
+            (!this.transientFailureUrls.has(url) ||
+              (retries < MAX_TRANSIENT_RETRIES &&
+                Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
           // A persisted size-limit error is only retried when the caller lifts
           // the limit, so oversized files are not re-downloaded on every visit.
           const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
-          if (!isTransientError && !isRetriableTimeout && !isSizeLimitLifted) {
+          // An ipfs failure is a verdict on one gateway, not on the resource:
+          // once the user points the option at another gateway the entry is
+          // re-requested right away, whatever the error was and however
+          // recently it was recorded. Only while the option is on, since with
+          // it off there is no gateway to retry through and the refusal would
+          // never settle. A sidecar that names its gateway is compared with
+          // the current one; an https gateway link without a recorded gateway
+          // failed without ever getting the fallback (the option was off, or
+          // the sidecar predates it), so it gets one now — the attempt records
+          // the gateway and settles it. An ipfs:// sidecar without a gateway
+          // predates gateway tracking and follows the transient-error rules.
+          const isGatewayChanged =
+            isIpfsBackedUrl(url) &&
+            ipfsGatewayEnabled() &&
+            (cacheInfo.gateway === undefined ? !isIpfsUrl(url) : cacheInfo.gateway !== ipfsGatewayBase());
+          if (!isAbortError && !isRetriableTransientError && !isSizeLimitLifted && !isGatewayChanged) {
             return cacheInfo;
           }
 
@@ -472,19 +672,55 @@ export default class CacheManager extends EventEmitter {
         const limitedRemoteFileDownload = async (): Promise<CacheInfo> => {
           const cacheFilePath = this.getCacheFilePath(url);
 
-          log('Starting download', url);
-          const headers = await downloadFile(url, cacheFilePath, {
+          // One active-transfer deadline covers the original host and fallback.
+          // Queue wait consumes no allowance; coalesced callers can tighten it.
+          if (budget.remaining <= 0) {
+            throw new Error('Request exceeded the shared download deadline');
+          }
+          transferDeadline.start();
+          const downloadOptions = {
             timeout,
             maxSize,
+            maxDuration: transferDeadline.remaining(),
             signal: abortController.signal,
             overrideFile: true,
-          });
+            gatewayBase: requestGateway,
+          };
 
+          log('Starting download', url);
+          let headers: Headers;
+          try {
+            headers = await downloadFile(url, cacheFilePath, downloadOptions);
+          } catch (downloadError) {
+            // An https gateway URL names its content by CID, so when its own
+            // host fails (gone, rate limiting, challenging the request) the
+            // same bytes can be fetched through the user's gateway and are
+            // still verified against the on-chain hash. Only when the option
+            // is on, the host is not already that gateway, the failure is
+            // the host's — not an abort, a size cap, or the option itself —
+            // and the shared deadline has time left.
+            const timeLeft = transferDeadline.remaining();
+            const fallbackUrl =
+              timeLeft > 0 ? this.getGatewayFallbackUrl(url, requestGateway, downloadError as Error) : undefined;
+            if (!fallbackUrl) {
+              throw downloadError;
+            }
+
+            log(`Download failed (${(downloadError as Error).message}), retrying through the gateway`, url);
+            headers = await downloadFile(url, cacheFilePath, {
+              ...downloadOptions,
+              requestUrl: fallbackUrl,
+              maxDuration: timeLeft,
+            });
+          }
+
+          transferDeadline.throwIfExpired();
           log('Download finished', url);
 
           // compute checksum
           const checksum = await getChecksum(cacheFilePath);
 
+          transferDeadline.throwIfExpired();
           log('Checksum computed', url);
 
           // save headers to a local JSON file
@@ -526,38 +762,92 @@ export default class CacheManager extends EventEmitter {
           throw error;
         }
 
-        const currentError = (error as Error) ?? new Error('Unknown fetchRemoteContent error');
+        const currentError =
+          transferDeadline.error ?? (error as Error) ?? new Error('Unknown fetchRemoteContent error');
 
-        if (isDownloadTimeoutError(currentError.message)) {
-          this.timedOutUrls.add(url);
+        const isTransient = isTransientDownloadError(currentError.message);
+        if (isTransient) {
+          this.transientFailureUrls.add(url);
         }
 
         return await this.setCacheInfo(url, {
           state: CacheState.ERROR,
           error: currentError.message,
+          ...(isTransient ? { retries: this.consecutiveTransientFailures(previousCacheInfo, requestGateway) + 1 } : {}),
+          // which gateway the verdict belongs to (see isGatewayChanged above)
+          ...(requestGateway === undefined ? {} : { gateway: requestGateway }),
         });
       } finally {
-        this.ongoingRequests.delete(url);
+        transferDeadline.finish();
+        // Clearing may have allowed a replacement request under this key.
+        if (this.ongoingRequests.get(url) === ongoingRequestEntry) {
+          this.ongoingRequests.delete(url);
+        }
       }
     };
 
     const promise = process();
 
-    this.ongoingRequests.set(url, {
+    ongoingRequestEntry = {
       abort: () => abortController.abort(),
       promise,
-    });
+      gateway: requestGateway,
+      deadline: transferDeadline,
+    };
+    this.ongoingRequests.set(url, ongoingRequestEntry);
 
-    return promise;
+    return consume(ongoingRequestEntry);
   }
 
-  async getHeaders(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ): Promise<Headers> {
+  // How many transient failures in a row the persisted outcome already
+  // records — zero when there is none, when the last outcome was anything
+  // other than a transient failure (a success, a settled error, an abort), or
+  // when it went through a different gateway: a failure is a verdict on one
+  // gateway, so a new gateway starts with a clean slate.
+  private consecutiveTransientFailures(previous: CacheInfo | undefined, gateway: string | undefined): number {
+    if (
+      previous?.state !== CacheState.ERROR ||
+      !isTransientDownloadError(previous.error) ||
+      previous.gateway !== gateway
+    ) {
+      return 0;
+    }
+
+    return previous.retries ?? 0;
+  }
+
+  // The configured-gateway URL to refetch an https gateway URL from after its
+  // own host failed, or undefined when no fallback applies.
+  private getGatewayFallbackUrl(url: string, gatewayBase: string | undefined, error: Error): string | undefined {
+    if (gatewayBase === undefined || !ipfsGatewayEnabled()) {
+      return undefined;
+    }
+
+    const ipfsPath = getIpfsPathFromGatewayUrl(url);
+    if (!ipfsPath) {
+      // ipfs:// URIs already went through the gateway
+      return undefined;
+    }
+
+    const isHostFailure =
+      !['Response aborted', 'Request aborted', MAX_FILE_SIZE_EXCEEDED_ERROR].includes(error.message) &&
+      !(error instanceof IpfsGatewayDisabledError);
+    if (!isHostFailure) {
+      return undefined;
+    }
+
+    const fallbackUrl = ipfsToGatewayUrl(`ipfs://${ipfsPath}`, gatewayBase);
+    // The URL is already served by the configured gateway — the same host in
+    // path style, or that host behind a `<CID>.ipfs.` subdomain — so a retry
+    // through it would ask the operator that just failed: nothing else to try.
+    if (fallbackUrl === url || getGatewayHost(url) === getGatewayHost(gatewayBase)) {
+      return undefined;
+    }
+
+    return fallbackUrl;
+  }
+
+  async getHeaders(url: string, options?: CacheRequestOptions): Promise<Headers> {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
@@ -579,42 +869,74 @@ export default class CacheManager extends EventEmitter {
     throw new Error('Unknown cache state');
   }
 
-  async getContent(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ): Promise<Buffer> {
-    if (!isValidURL(url)) {
-      throw new Error(`Invalid URL: ${url}`);
-    }
-
-    const cacheInfo = await this.fetchRemoteContent(url, options);
-
-    if (cacheInfo.state === CacheState.ERROR) {
-      throw new Error(cacheInfo.error);
-    }
-
-    if (cacheInfo.state === CacheState.NOT_CACHED) {
-      throw new Error('Url is not cached');
-    }
-
-    if (cacheInfo.state === CacheState.CACHED) {
-      const filePath = this.getCacheFilePath(url);
-      return fs.readFile(filePath);
-    }
-
-    throw new Error('Unknown cache state');
+  async getContent(url: string, options?: CacheRequestOptions): Promise<Buffer> {
+    return (await this.getContentWithInfo(url, options)).content;
   }
 
-  async getChecksum(
+  // Keep bytes, headers and checksum from one stable cache decision. A clear,
+  // invalidation or migration can overtake the lookup, even finish before its
+  // continuation resumes. A generation check detects that completed operation.
+  async getContentWithInfo(
     url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ): Promise<string> {
+    options: CacheRequestOptions = {},
+  ): Promise<CacheContent & { content: Buffer }> {
+    const budget = { remaining: normalizeDownloadDuration(options.maxDuration) };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const generation = this.maintenanceGeneration;
+      // eslint-disable-next-line no-await-in-loop -- Recheck a decision overtaken by maintenance.
+      const cacheInfo = await this.fetchRemoteContent(url, options, budget);
+      if (cacheInfo.state === CacheState.ERROR) {
+        throw new Error(cacheInfo.error);
+      }
+      if (cacheInfo.state !== CacheState.CACHED) {
+        throw new Error('Url is not cached');
+      }
+      if (this.maintenance || generation !== this.maintenanceGeneration) {
+        // eslint-disable-next-line no-await-in-loop -- Wait outside the drained request/read maps.
+        await this.waitForMaintenance();
+        // eslint-disable-next-line no-continue -- The completed maintenance invalidated this lookup.
+        continue;
+      }
+
+      const filePath = this.getCacheFilePath(url);
+      const read = fs.readFile(filePath);
+      // Register synchronously after the generation check. Maintenance waits
+      // for this read before touching its files; eviction also skips the path.
+      this.activeReads.set(read, { url, filePath });
+      try {
+        // eslint-disable-next-line no-await-in-loop -- Read only the stable decision's bytes.
+        const content = await read;
+        return {
+          content,
+          headers: cacheInfo.headers,
+          checksum: crypto.createHash('sha256').update(content).digest('hex'),
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error;
+        }
+      } finally {
+        this.activeReads.delete(read);
+      }
+      // An external deletion or a completed eviction may leave an orphaned
+      // sidecar. Drop it before one bounded retry, using the remaining budget.
+      // eslint-disable-next-line no-await-in-loop -- Repair the missing entry before retrying.
+      await this.invalidate(url);
+    }
+    throw new Error('Cache changed repeatedly while reading; please retry');
+  }
+
+  // Waits out every maintenance operation (clear, migration, invalidation) in
+  // progress or queued. A failed operation is its caller's to report; here it
+  // only ends the wait.
+  private async waitForMaintenance() {
+    while (this.maintenance) {
+      // eslint-disable-next-line no-await-in-loop -- another operation may have been queued while this one ran
+      await this.maintenance.catch(() => {});
+    }
+  }
+
+  async getChecksum(url: string, options?: CacheRequestOptions): Promise<string> {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
@@ -636,13 +958,7 @@ export default class CacheManager extends EventEmitter {
     throw new Error('Unknown cache state');
   }
 
-  async getURI(
-    url: string,
-    options?: {
-      maxSize?: number;
-      timeout?: number;
-    },
-  ) {
+  async getURI(url: string, options?: CacheRequestOptions) {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
@@ -671,30 +987,80 @@ export default class CacheManager extends EventEmitter {
   // whole batch. This lets the renderer classify NFTs that are not on screen
   // (and so never verify their files) from outcomes persisted by earlier
   // visits and sessions.
+  //
+  // The urls are NFT data the minter wrote, so the batch is bounded here as
+  // well as by the caller: a batch over the cap is refused outright, and the
+  // lookups within one run a few at a time — each one hashes and validates
+  // its url synchronously before its file read, and thousands of those in one
+  // go would stall the main process for every window of the wallet.
   async getCacheInfos(urls: string[]): Promise<CacheInfo[]> {
+    if (!Array.isArray(urls)) {
+      throw new Error('Invalid urls');
+    }
+
+    if (urls.length > MAX_CACHE_INFO_LOOKUPS) {
+      throw new Error(`Too many urls: ${urls.length} (at most ${MAX_CACHE_INFO_LOOKUPS} per lookup)`);
+    }
+
+    const lookupLimit = limit(CACHE_INFO_LOOKUP_CONCURRENCY);
+
     return Promise.all(
-      urls.map(async (url) => {
-        try {
-          return await this.getCacheInfoByURL(url);
-        } catch (error) {
-          return {
-            url,
-            state: CacheState.ERROR,
-            error: (error as Error).message,
-            timestamp: Date.now(),
-          };
-        }
-      }),
+      urls.map((url) =>
+        lookupLimit<CacheInfo>(async () => {
+          try {
+            return await this.getCacheInfoByURL(url);
+          } catch (error) {
+            return {
+              url,
+              state: CacheState.ERROR,
+              error: (error as Error).message,
+              timestamp: Date.now(),
+            };
+          }
+        }),
+      ),
     );
   }
 
   async clearCache() {
-    // cancel all ongoing requests
-    for (const ongoingRequest of this.ongoingRequests.values()) {
-      ongoingRequest.abort();
+    // one clear at a time; a second call joins the one in progress
+    if (!this.clearing) {
+      this.clearing = this.runMaintenance(() => this.performClear()).finally(() => {
+        this.clearing = undefined;
+      });
     }
-    this.ongoingRequests.clear();
 
+    return this.clearing;
+  }
+
+  // Install the barrier before scheduling any work. A failed operation is
+  // reported to its caller but must not poison subsequent maintenance/fetches.
+  // Invalidation drains only its URL; clear and migration must drain them all.
+  private runMaintenance(operation: () => Promise<void>, url?: string): Promise<void> {
+    this.maintenanceGeneration += 1;
+    const previous = this.maintenance ?? Promise.resolve();
+    const pending = previous
+      .catch(() => {})
+      .then(async () => {
+        const ongoing = Array.from(this.ongoingRequests.entries())
+          .filter(([requestUrl]) => url === undefined || requestUrl === url)
+          .map(([, request]) => request);
+        ongoing.forEach((request) => request.abort());
+        const reads = Array.from(this.activeReads.entries())
+          .filter(([, read]) => url === undefined || read.url === url)
+          .map(([read]) => read);
+        await Promise.allSettled([...ongoing.map((request) => request.promise), ...reads]);
+        await operation();
+      });
+    this.maintenance = pending;
+    return pending.finally(() => {
+      if (this.maintenance === pending) {
+        this.maintenance = undefined;
+      }
+    });
+  }
+
+  private async performClear() {
     const files = await fs.readdir(this.cacheDirectory);
     const unlinkPromises = files.map(async (file) => {
       const hasSuffix = SUFFIXES.some((suffix) => file.endsWith(suffix));
@@ -723,32 +1089,114 @@ export default class CacheManager extends EventEmitter {
 
     const newDirectory = result.filePaths[0];
 
-    await ensureDirectoryExists(newDirectory);
+    // The picker opens on the current cache directory, so confirming it is the
+    // common way to change nothing. Decide that here: the barrier below aborts
+    // every download in flight before its operation runs, which is the price
+    // of a move, not of a no-op. The check inside the barrier still covers a
+    // migration that completes while this one waits its turn.
+    if (path.resolve(this.cacheDirectory) === path.resolve(newDirectory)) {
+      return;
+    }
 
-    // move the files from the current cache directory to the new directory
-    const files = await fs.readdir(this.cacheDirectory);
-    const movePromises = files.map(async (file) => {
-      if (!isChiaCacheFile(file)) {
+    await this.runMaintenance(async () => {
+      // Resolve the source inside the serialized operation, not before the
+      // native picker: another migration may have completed while it was open.
+      const oldDirectory = this.cacheDirectory;
+      if (path.resolve(oldDirectory) === path.resolve(newDirectory)) {
         return;
       }
+      await ensureDirectoryExists(newDirectory);
 
-      const oldFilePath = path.join(this.cacheDirectory, file);
-      const newFilePath = path.join(newDirectory, file);
+      // All admitted transfers have settled, including their checksum and
+      // sidecar writes. No live temp can be left here and no replacement can
+      // start until this operation releases the barrier.
+      const files = await fs.readdir(oldDirectory);
+      const moved: { file: string; destination: string }[] = [];
+      // Every source that was copied, orphans included: the old directory is
+      // never looked at again once the destination is published, so anything
+      // left there is never counted, evicted or cleared.
+      const copiedSources: string[] = [];
+      try {
+        for (const file of files.filter((name) => isChiaCacheFile(name))) {
+          const source = path.join(oldDirectory, file);
+          const destination = path.join(newDirectory, file);
+          if (isChiaCacheTempFile(file)) {
+            // a leftover: nothing in flight is left by now
+            // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
+            await safeUnlink(source);
+          } else {
+            try {
+              // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
+              const stat = await fs.lstat(source);
+              if (stat.isFile()) {
+                // Do not overwrite a pre-existing cache in the destination. Copy
+                // first also permits cross-volume migration; remove the source
+                // only after the entire copy pass has succeeded.
+                // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
+                await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+                moved.push({ file, destination });
+                copiedSources.push(source);
+              }
+            } catch (error) {
+              // A source deleted from outside since the listing has nothing
+              // to migrate; it must not fail the whole move.
+              if ((error as { code?: string }).code !== 'ENOENT') {
+                throw error;
+              }
+            }
+          }
+        }
 
-      const stat = await fs.lstat(oldFilePath);
-
-      if (stat.isFile()) {
-        await fs.rename(oldFilePath, newFilePath);
+        // A data file whose sidecar did not make it across cannot be served
+        // (the cache never trusts bytes without their sidecar), so it is not
+        // carried over either. The reverse holds for a CACHED sidecar whose
+        // data file did not arrive: the cache would trust it and then fail to
+        // read the bytes, until the entry is invalidated or the cache cleared.
+        // Dropping it lets the next request fetch the entry afresh. Sidecars
+        // in any other state stand on their own, as ERROR entries do.
+        const movedFiles = new Set(moved.map(({ file }) => file));
+        const orphanChecks = await Promise.all(
+          moved.map(async (entry) => {
+            const { file, destination } = entry;
+            if (!isChiaCacheInfoFile(file)) {
+              return movedFiles.has(getInfoFilePath(file)) ? undefined : entry;
+            }
+            if (movedFiles.has(file.slice(0, -INFO_SUFFIX.length))) {
+              return undefined;
+            }
+            return (await isCachedSidecar(destination)) ? entry : undefined;
+          }),
+        );
+        const orphans = orphanChecks.filter((entry): entry is (typeof moved)[number] => entry !== undefined);
+        await Promise.all(orphans.map(({ destination }) => safeUnlink(destination)));
+        orphans.forEach((orphan) => moved.splice(moved.indexOf(orphan), 1));
+      } catch (error) {
+        await Promise.all(moved.map(({ destination }) => safeUnlink(destination)));
+        throw error;
       }
+
+      // Publish only a complete destination. Failure to unlink an old copy is
+      // logged rather than turning a successful copy into a split live entry.
+      await Promise.all(
+        copiedSources.map(async (source) => {
+          try {
+            await fs.unlink(source);
+          } catch (error) {
+            log(`Could not remove migrated cache copy: ${(error as Error).message}`);
+          }
+        }),
+      );
+      this.cacheDirectory = newDirectory;
+      this.emit('sizeChanged');
     });
-
-    await Promise.all(movePromises);
-
-    this.cacheDirectory = newDirectory;
   }
 
   private async removeOldestFiles(targetSize: number, preserveFilePath?: string): Promise<void> {
     const files = await fs.readdir(this.cacheDirectory);
+    // Temp files of downloads in flight count toward the total like every
+    // other file but are never evicted — the download would fail; stale ones
+    // are evictable like any other file.
+    const inFlight = this.inFlightTempFilePaths();
     const filePaths = files
       .filter((file) => isChiaCacheFile(file) && !isChiaCacheInfoFile(file))
       .map((file) => path.join(this.cacheDirectory, file));
@@ -791,7 +1239,8 @@ export default class CacheManager extends EventEmitter {
         break;
       }
 
-      if (fileStat.filePath !== preserveFilePath) {
+      const beingRead = Array.from(this.activeReads.values()).some((read) => read.filePath === fileStat.filePath);
+      if (fileStat.filePath !== preserveFilePath && !inFlight.has(fileStat.filePath) && !beingRead) {
         totalSize -= fileStat.size;
         filesToRemove.push(fileStat);
       }
@@ -811,25 +1260,25 @@ export default class CacheManager extends EventEmitter {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
-    // cancel the ongoing request
-    const ongoingRequest = this.ongoingRequests.get(url);
-    if (ongoingRequest) {
-      ongoingRequest.abort();
-    }
 
-    // prepare invalidation
-    const filePath = this.getCacheFilePath(url);
+    // Register before the first await so a later migration cannot copy an
+    // entry while its deletion is underway. Drain this URL's complete request
+    // first: abort cleanup or a late success can still write its sidecar.
+    await this.runMaintenance(async () => {
+      // An earlier migration may have changed the directory while we waited.
+      const filePath = this.getCacheFilePath(url);
+      await safeUnlink(filePath);
+      await safeUnlink(getInfoFilePath(filePath));
 
-    // remove the file
-    await safeUnlink(filePath);
-    await safeUnlink(getInfoFilePath(filePath));
-
-    this.emit('sizeChanged');
+      this.emit('sizeChanged');
+    }, url);
   }
 
   async setMaxCacheSize(maxCacheSize: number | string) {
     this.maxCacheSize = maxCacheSize;
     if (this.maxCacheSize > 0) {
+      // eviction deletes files too — see invalidate
+      await this.waitForMaintenance();
       await this.removeOldestFiles(this.maxCacheSize);
     }
   }

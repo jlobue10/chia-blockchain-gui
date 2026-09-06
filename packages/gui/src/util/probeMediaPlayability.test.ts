@@ -1,4 +1,8 @@
-import probeMediaPlayability, { resetMediaPlayabilityVerdicts } from './probeMediaPlayability';
+import probeMediaPlayability, {
+  resetMediaPlayabilityVerdicts,
+  MAX_CONCURRENT_MEDIA_PROBES,
+  MAX_QUEUED_MEDIA_PROBES,
+} from './probeMediaPlayability';
 
 type FakeMediaElement = HTMLVideoElement & {
   emit: (event: string) => void;
@@ -44,6 +48,60 @@ describe('probeMediaPlayability', () => {
   beforeEach(() => {
     resetMediaPlayabilityVerdicts();
     jest.useRealTimers();
+  });
+
+  it('bounds active decoders and removes a queued cancellation without admitting extra work', async () => {
+    const active = Array.from({ length: MAX_CONCURRENT_MEDIA_PROBES }, () => fakeMediaElement());
+    const running = active.map((element, i) => probe(element, `cache://active-${i}`));
+    const controller = new AbortController();
+    const canceledElement = jest.fn(() => fakeMediaElement());
+    const canceled = probeMediaPlayability('cache://queued-cancel', 'video', {
+      signal: controller.signal,
+      createElement: canceledElement,
+    });
+    const next = fakeMediaElement();
+    const createNext = jest.fn(() => next);
+    const queued = probeMediaPlayability('cache://next', 'video', { createElement: createNext });
+    controller.abort();
+    await expect(canceled).resolves.toBe('unknown');
+    expect(canceledElement).not.toHaveBeenCalled();
+    expect(createNext).not.toHaveBeenCalled();
+    active[0].emit('loadedmetadata');
+    expect(createNext).toHaveBeenCalledTimes(1);
+    active.slice(1).forEach((element) => element.emit('loadedmetadata'));
+    next.emit('loadedmetadata');
+    await Promise.all([...running, queued]);
+  });
+
+  it('expires queued probes without allocating an element and caps the queue', async () => {
+    jest.useFakeTimers();
+    const active = Array.from({ length: MAX_CONCURRENT_MEDIA_PROBES }, (_, i) =>
+      probe(fakeMediaElement(), `cache://held-${i}`),
+    );
+    const createElement = jest.fn(() => fakeMediaElement());
+    const queued = Array.from({ length: MAX_QUEUED_MEDIA_PROBES }, (_, i) =>
+      probeMediaPlayability(`cache://queued-${i}`, 'video', { timeout: 100, createElement }),
+    );
+    await expect(probeMediaPlayability('cache://overflow', 'video', { createElement })).resolves.toBe('unknown');
+    jest.advanceTimersByTime(100);
+    expect(await Promise.all(queued)).toEqual(Array(MAX_QUEUED_MEDIA_PROBES).fill('unknown'));
+    expect(createElement).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(15_000);
+    await Promise.all(active);
+  });
+
+  it('releases slots when element creation fails', async () => {
+    const createElement = () => {
+      throw new Error('No decoder');
+    };
+    const failures = Array.from({ length: MAX_CONCURRENT_MEDIA_PROBES + 1 }, (_, i) =>
+      probeMediaPlayability(`cache://failed-${i}`, 'video', { createElement }),
+    );
+    expect(await Promise.all(failures)).toEqual(Array(failures.length).fill('unknown'));
+    const element = fakeMediaElement();
+    const next = probe(element, 'cache://after-failure');
+    element.emit('loadedmetadata');
+    await expect(next).resolves.toBe('playable');
   });
 
   it('reports a file whose metadata loads as playable', async () => {

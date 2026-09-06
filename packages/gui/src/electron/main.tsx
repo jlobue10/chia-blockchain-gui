@@ -63,7 +63,7 @@ import downloadFile from './utils/downloadFile';
 import fetchJSON from './utils/fetchJSON';
 import ipcMainHandle from './utils/ipcMainHandle';
 import maybeIpfsToGatewayUrl from './utils/ipfsGateway';
-import isValidURL from './utils/isValidURL';
+import isValidURL, { isValidRequestURL } from './utils/isValidURL';
 import { loadConfig, checkConfigFileExists } from './utils/loadConfig';
 import { getDefaultLogPath, LogPathValidationError, resolveTrustedLogPath } from './utils/logPath';
 import manageDaemonLifetime from './utils/manageDaemonLifetime';
@@ -581,9 +581,10 @@ if (ensureSingleInstance() && ensureCorrectEnvironment()) {
       // has enabled the gateway, download ipfs URIs through it like every
       // other network path. With the option off there is nothing the
       // downloader could fetch, so the request is dropped instead of handing
-      // Chromium a URL it silently fails on.
+      // Chromium a URL it silently fails on. The gateway form is the URL
+      // actually requested, so it is the one validated.
       const downloadUrl = maybeIpfsToGatewayUrl(urlLocal);
-      if (isIpfsUrl(downloadUrl)) {
+      if (isIpfsUrl(downloadUrl) || !isValidRequestURL(downloadUrl)) {
         return;
       }
 

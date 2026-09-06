@@ -1,17 +1,16 @@
 import type { NFTInfo } from '@chia-network/api';
-import debug from 'debug';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 
 import type Metadata from '../@types/Metadata';
-import compareChecksums from '../util/compareChecksums';
+import createNFTUriVerifier from '../util/createNFTUriVerifier';
+import { MAX_URIS_PER_CANDIDATE } from '../util/getNFTPreviewStatusFromCache';
 
 import selectNFTPreviewState, { type NFTPreviewState } from './selectNFTPreviewState';
 import useCache from './useCache';
 import useIpfsGateway from './useIpfsGateway';
+import { useIpfsGatewayBase } from './useIpfsGatewayUrl';
 import useNFT from './useNFT';
 import useNFTMetadata from './useNFTMetadata';
-
-const log = debug('chia-gui:useNFTVerifyHash');
 
 export type UseNFTVerifyHashOptions = {
   preview?: boolean;
@@ -26,10 +25,10 @@ export type UseNFTVerifyHashOptions = {
 
 function withoutExcluded(uris: string[] | undefined, excluded: Set<string>): string[] | undefined {
   if (!uris || excluded.size === 0) {
-    return uris;
+    return uris?.slice(0, MAX_URIS_PER_CANDIDATE);
   }
 
-  return uris.filter((uri) => !excluded.has(uri));
+  return uris.slice(0, MAX_URIS_PER_CANDIDATE).filter((uri) => !excluded.has(uri));
 }
 
 export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHashOptions = {}) {
@@ -37,18 +36,17 @@ export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHa
 
   // a stable key so a caller passing a fresh array each render does not
   // restart preview verification
-  const excludedPreviewKey = excludedPreviewUris?.length ? excludedPreviewUris.join('\n') : '';
-  const excludedPreview = useMemo(
-    () => new Set(excludedPreviewKey ? excludedPreviewKey.split('\n') : []),
-    [excludedPreviewKey],
-  );
+  const excludedPreviewKey = JSON.stringify(excludedPreviewUris?.slice(0, MAX_URIS_PER_CANDIDATE * 3) ?? []);
+  const excludedPreview = useMemo(() => new Set<string>(JSON.parse(excludedPreviewKey)), [excludedPreviewKey]);
 
   const { getChecksum } = useCache();
-  // Not read directly: the value changes which URIs the main process will
-  // fetch at all, so both verification effects list it as a dependency and
-  // re-run when the user flips the option — without this, NFTs already on
-  // screen would keep their failed state until a remount.
+  // Not read directly: these change which URLs the main process will fetch
+  // (whether ipfs URIs are fetched at all, and through which gateway), so
+  // both verification effects list them as dependencies and re-run when the
+  // user flips the option or picks another gateway — without this, NFTs
+  // already on screen would keep their failed state until a remount.
   const [ipfsGateway] = useIpfsGateway();
+  const ipfsGatewayBase = useIpfsGatewayBase();
 
   const { nft, isLoading: isLoadingNFT, error: errorNFT } = useNFT(nftId);
   const { isLoading: isLoadingMetadata, metadata, error: errorMetadata } = useNFTMetadata(nftId);
@@ -112,55 +110,16 @@ export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHa
   // frames the stored states are
   const error = errorNFT || errorMetadata || (isDataStale ? undefined : errorVerify);
 
-  const findValidUri = useCallback(
-    async (
-      uris: string[] | undefined,
-      hash: string | undefined,
-      onlyFirst: boolean = false,
-    ): Promise<NFTPreviewState | undefined> => {
-      if (!uris || !uris.length || !hash) {
-        return undefined;
-      }
-
-      // use only first uri when onlyFirst is true
-      const urisToCheck = onlyFirst ? [uris[0]] : uris;
-      let first: NFTPreviewState | undefined;
-
-      for (const uri of urisToCheck) {
-        try {
-          // eslint-disable-next-line no-await-in-loop -- we need sync version
-          const checksum = await getChecksum(uri, {
-            maxSize: ignoreSizeLimit ? -1 : undefined,
-          });
-
-          const isValid = compareChecksums(checksum, hash);
-          if (isValid) {
-            return {
-              isVerified: true,
-              uri,
-            };
-          }
-
-          throw new Error('Invalid hash checksum');
-        } catch (e) {
-          log(`Failed to fetch ${uri}: ${(e as Error).message}`);
-          const isMismatch = (e as Error).message === 'Invalid hash checksum';
-          // a hash mismatch on any uri outranks a download failure — a
-          // tampered file must not be reported as merely unavailable
-          if (!first || (first.failedFetch && isMismatch)) {
-            first = {
-              isVerified: false,
-              uri,
-              error: e as Error,
-              failedFetch: !isMismatch,
-            };
-          }
-        }
-      }
-
-      return first;
-    },
-    [getChecksum, ignoreSizeLimit],
+  const findValidUri = useMemo(
+    () => createNFTUriVerifier(getChecksum, ignoreSizeLimit ? -1 : undefined),
+    // A refresh or gateway/size-policy change must discard remembered failures.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Input identity deliberately defines memo lifetime.
+    [getChecksum, ignoreSizeLimit, nft, ipfsGateway, ipfsGatewayBase],
+  );
+  const findPreviewUri = useMemo(
+    () => createNFTUriVerifier(getChecksum, ignoreSizeLimit ? -1 : undefined),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Metadata refresh resets preview decisions only.
+    [getChecksum, ignoreSizeLimit, nft, metadata, ipfsGateway, ipfsGatewayBase],
   );
 
   const validateData = useCallback(
@@ -188,14 +147,14 @@ export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHa
       try {
         const { preview_video_uris: previewVideoUris, preview_video_hash: previewVideoHash } = nftMetadata;
 
-        const videoState = await findValidUri(withoutExcluded(previewVideoUris, excludedPreview), previewVideoHash);
+        const videoState = await findPreviewUri(previewVideoUris, previewVideoHash, excludedPreview);
         if (generationRef.current === generation) {
           setPreviewVideo(videoState);
         }
 
         if (!videoState?.isVerified) {
           const { preview_image_uris: previewImageUris, preview_image_hash: previewImageHash } = nftMetadata;
-          const imageState = await findValidUri(withoutExcluded(previewImageUris, excludedPreview), previewImageHash);
+          const imageState = await findPreviewUri(previewImageUris, previewImageHash, excludedPreview);
           if (generationRef.current === generation) {
             setPreviewImage(imageState);
           }
@@ -210,7 +169,7 @@ export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHa
         }
       }
     },
-    [findValidUri, excludedPreview],
+    [findPreviewUri, excludedPreview],
   );
 
   // Data and preview verification run as independent effects: the data file
@@ -238,7 +197,7 @@ export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHa
         dataGeneration.current += 1;
       }
     };
-  }, [nft, isLoadingNFT, validateData, ipfsGateway]);
+  }, [nft, isLoadingNFT, validateData, ipfsGateway, ipfsGatewayBase]);
 
   useEffect(() => {
     const generation = previewGeneration.current + 1;
@@ -268,7 +227,17 @@ export default function useNFTVerifyHash(nftId?: string, options: UseNFTVerifyHa
         previewGeneration.current += 1;
       }
     };
-  }, [preview, nft, metadata, isLoadingNFT, isLoadingMetadata, validatePreview, ipfsGateway, excludedPreviewKey]);
+  }, [
+    preview,
+    nft,
+    metadata,
+    isLoadingNFT,
+    isLoadingMetadata,
+    validatePreview,
+    ipfsGateway,
+    ipfsGatewayBase,
+    excludedPreviewKey,
+  ]);
 
   const previewState = useMemo(
     () =>
