@@ -1,23 +1,27 @@
-import FileType from '../../constants/FileType';
-import getFileType from '../../util/getFileType';
-import { isIpfsUrl } from '../../util/ipfs';
 import { catAssetIdToName } from '../api/catAssetIdToName';
 import { getOfferSummary } from '../api/getOfferSummary';
 import { getWalletInfos, type WalletInfo } from '../api/getWalletNames';
 import { nftGetInfo } from '../api/nftGetInfo';
-import { nftGetImageDataUrl, nftGetMetadata } from '../api/nftGetMetadata';
 import resolveAssetDisplayKind from '../api/resolveAssetDisplayKind';
 import WalletType from '../constants/WalletType';
 import type { DisplayWalletDelta, DisplayWalletDeltaItem } from '../dialogs/Confirm/Confirm';
-import { ipfsGatewayEnabled } from '../utils/ipfsGateway';
 import { isNumericKey } from '../utils/isNumericKey';
 import { isPlainObject } from '../utils/isPlainObject';
-import isValidURL from '../utils/isValidURL';
 import mojoToCATLocaleString from '../utils/mojoToCATLocaleString';
 import mojoToChiaLocaleString from '../utils/mojoToChiaLocaleString';
 import { parseMojos } from '../utils/parseMojos';
 import toBech32m from '../utils/toBech32m';
 import { type WalletDelta, offerSummaryToWalletDelta, createOfferToWalletDelta } from '../utils/walletDelta';
+
+import { resolveNftPreviewUrl } from './resolveNftPreviewUrl';
+
+// Preserve the existing test/caller interface after isolating preview work.
+export {
+  resolveNftPreviewUrl,
+  MAX_NFT_PREVIEW_URI_ATTEMPTS,
+  MAX_NFT_PREVIEW_URI_INSPECTIONS,
+  MAX_NFT_PREVIEW_URI_LENGTH,
+} from './resolveNftPreviewUrl';
 
 type AssetDisplayKind = 'chia' | 'wallet' | 'cat' | 'nft' | 'unknown';
 
@@ -49,117 +53,6 @@ function hexToNftId(hex: string): string {
   } catch {
     return hex;
   }
-}
-
-// The confirmation dialog is not shown until preview resolution settles, so
-// every URI fallback for one NFT shares a single deadline — a long list of
-// dead or slow hosts must not hold the security dialog off screen for the
-// full per-fetch timeout each.
-const NFT_PREVIEW_RESOLUTION_BUDGET_MS = 20_000;
-
-// ...and at most this many fallbacks per URI list are tried at all. The lists
-// are minter-authored, and a deadline only bounds waiting: an attempt that
-// fails without ever reaching the network (an unfetchable URI, a refused
-// request) costs microseconds, so a deadline alone would let a long enough
-// list run its whole length. A count holds whatever an attempt costs.
-export const MAX_NFT_PREVIEW_URI_ATTEMPTS = 8;
-
-// The URIs of a minter-authored list the resolver will try: structurally
-// valid, and fetchable at all — with the gateway option off an ipfs:// URI is
-// refused before any request is made (toFetchableUrl), and such a refusal
-// happens synchronously in the fetcher's argument list, so a loop that
-// discovers it one URI at a time never yields to the event loop while it
-// works through the list. Dropping those URIs up front keeps every iteration
-// that remains a real network wait, which is what the deadline was sized for.
-function fetchableUris(uris: string[], ipfsFetchable: boolean): string[] {
-  return uris
-    .filter((uri) => isValidURL(uri) && (ipfsFetchable || !isIpfsUrl(uri)))
-    .slice(0, MAX_NFT_PREVIEW_URI_ATTEMPTS);
-}
-
-async function resolveVerifiedImage(
-  uris: string[],
-  expectedHash: string | undefined,
-  deadline: number,
-): Promise<string | undefined> {
-  if (!expectedHash) {
-    return undefined;
-  }
-
-  for (const uri of uris) {
-    const timeLeft = deadline - Date.now();
-    if (timeLeft <= 0) {
-      return undefined;
-    }
-
-    // URI lists are ordered fallbacks for the same content.
-    // eslint-disable-next-line no-await-in-loop -- Fallbacks must be tried in their declared order.
-    const dataUrl = await nftGetImageDataUrl(uri, expectedHash, timeLeft);
-    if (dataUrl) {
-      return dataUrl;
-    }
-  }
-
-  return undefined;
-}
-
-/** The confirmation dialog renders the preview in an `<img>`, which can only
- * display images — a video/audio payload would show as a broken image icon.
- * Fetch and hash-check the content in the main process, then return an immutable
- * data URL so the sandbox never performs a second, unauthenticated request. */
-export async function resolveNftPreviewUrl(
-  dataUris: string[],
-  dataHash: string | undefined,
-  metadataUris: string[],
-  metadataHash: string | undefined,
-): Promise<string | undefined> {
-  const deadline = Date.now() + NFT_PREVIEW_RESOLUTION_BUDGET_MS;
-  // read once per NFT, not once per URI: the preference is a synchronous
-  // file read
-  const ipfsFetchable = ipfsGatewayEnabled();
-  const validDataUris = dataUris.filter((uri) => isValidURL(uri) && (ipfsFetchable || !isIpfsUrl(uri)));
-
-  const imageDataUrl = await resolveVerifiedImage(
-    validDataUris.filter((uri) => getFileType(uri) === FileType.IMAGE).slice(0, MAX_NFT_PREVIEW_URI_ATTEMPTS),
-    dataHash,
-    deadline,
-  );
-  if (imageDataUrl) {
-    return imageDataUrl;
-  }
-
-  if (metadataHash) {
-    for (const metadataUri of fetchableUris(metadataUris, ipfsFetchable)) {
-      const timeLeft = deadline - Date.now();
-      if (timeLeft <= 0) {
-        break;
-      }
-
-      // Metadata URIs are ordered fallbacks for the same on-chain hash.
-      // eslint-disable-next-line no-await-in-loop -- Fallbacks must be tried in their declared order.
-      const metadata = await nftGetMetadata(metadataUri, metadataHash, timeLeft);
-      if (metadata) {
-        // eslint-disable-next-line no-await-in-loop -- Resolve each verified metadata fallback before moving on.
-        const previewDataUrl = await resolveVerifiedImage(
-          fetchableUris(metadata.preview_image_uris ?? [], ipfsFetchable),
-          metadata.preview_image_hash,
-          deadline,
-        );
-        if (previewDataUrl) {
-          return previewDataUrl;
-        }
-      }
-    }
-  }
-
-  // An extensionless data URI (common on IPFS) may be an image. Its verified
-  // response MIME type decides whether it can be used; known non-image types
-  // keep the placeholder.
-  return resolveVerifiedImage(
-    validDataUris.filter((uri) => getFileType(uri) === FileType.UNKNOWN).slice(0, MAX_NFT_PREVIEW_URI_ATTEMPTS),
-    dataHash,
-    deadline,
-  );
 }
 
 function parseRoyaltyPercentage(value: unknown): number | undefined {
