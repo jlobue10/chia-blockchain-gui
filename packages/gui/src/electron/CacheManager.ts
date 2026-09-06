@@ -128,6 +128,13 @@ export default class CacheManager extends EventEmitter {
     }
   > = new Map();
 
+  // Set while clearCache runs. A request that arrives mid-clear — a tile whose
+  // download the clear just aborted moving on to its next uri — waits for the
+  // clear to finish before it reads or writes anything: otherwise the unlink
+  // pass would take the new download's temp file from under it, and the
+  // failure that follows would be recorded into the cache just emptied.
+  private clearing: Promise<void> | undefined;
+
   // URLs whose download timed out during this session. A persisted timeout is
   // retried once per session — the set keeps a stalled host from being retried
   // (and holding a download slot) on every access within the same session.
@@ -492,6 +499,10 @@ export default class CacheManager extends EventEmitter {
 
     const process = async (): Promise<CacheInfo> => {
       try {
+        // a clear in progress must finish before this request touches the
+        // cache directory (see `clearing`)
+        await this.clearing;
+
         // From isValidURL.ts
         // isURL returns false for URLs with unencoded spaces. We can't use
         // encodeURI if the URL is already encoded, so we attempt to decode
@@ -747,13 +758,26 @@ export default class CacheManager extends EventEmitter {
   }
 
   async clearCache() {
+    // one clear at a time; a second call joins the one in progress
+    if (!this.clearing) {
+      this.clearing = this.performClear().finally(() => {
+        this.clearing = undefined;
+      });
+    }
+
+    return this.clearing;
+  }
+
+  private async performClear() {
     // Cancel every ongoing request and wait for each to settle before the
     // unlink pass. A download settles only as it fails or finishes: an aborted
     // one removes its temp file and records its outcome then, and one already
     // past its transfer may still rename its temp file into a cached file.
     // Clearing before that would leave those files — and a fresh sidecar per
     // abort — behind in a cache that was just reported empty; clearing from
-    // under a download would only race its own cleanup.
+    // under a download would only race its own cleanup. Requests that arrive
+    // while this runs wait for it (see `clearing`), so nothing new starts
+    // writing into the directory before the unlink pass is done.
     const ongoingRequests = Array.from(this.ongoingRequests.values());
     for (const ongoingRequest of ongoingRequests) {
       ongoingRequest.abort();

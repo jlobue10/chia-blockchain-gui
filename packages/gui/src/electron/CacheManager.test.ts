@@ -331,6 +331,53 @@ describe('CacheManager eviction', () => {
     await expect(fs.readdir(cacheDirectory)).resolves.toEqual([]);
   });
 
+  it('holds a request that arrives during a clear until the clear is done', async () => {
+    const payload = Buffer.from('next uri');
+    let clearFinished = false;
+    let nextDownloadStartedAfterClear: boolean | undefined;
+    mockDownloadFile
+      // the download the clear aborts: like the real one, it fails on abort
+      .mockImplementationOnce(async (_url, localPath, options) => {
+        await fs.writeFile(`${localPath}.tmp`, Buffer.alloc(300));
+        await new Promise<void>((resolve) => {
+          options?.signal?.addEventListener('abort', () => resolve());
+        });
+        await fs.unlink(`${localPath}.tmp`);
+        throw new Error('Request aborted');
+      })
+      // the download a tile starts for its next uri as soon as it sees that failure
+      .mockImplementationOnce(async (_url, localPath) => {
+        nextDownloadStartedAfterClear = clearFinished;
+        await fs.writeFile(localPath, payload);
+        return {
+          'content-type': 'image/png',
+        };
+      });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const aborted = cacheManager.getContent('https://example.com/first.png');
+    await untilDownloadsStarted(1);
+    // a tile that sees its download fail moves straight on to the next uri —
+    // while the clear is still waiting on that very failure
+    const next = aborted.catch(() => cacheManager.getContent('https://example.com/second.png'));
+
+    const clear = cacheManager.clearCache().then(() => {
+      clearFinished = true;
+    });
+    await clear;
+
+    await expect(next).resolves.toEqual(payload);
+    // the second download did not start until the clear had finished, so the
+    // unlink pass could not take its temp file from under it
+    expect(nextDownloadStartedAfterClear).toBe(true);
+    await expect(fs.readdir(cacheDirectory)).resolves.toHaveLength(2); // its data file and sidecar
+  });
+
   it('evicts a stale temp file but never the one a download in flight is writing', async () => {
     let finishDownload!: () => void;
     const inFlightUrl = 'https://example.com/in-flight.png';
