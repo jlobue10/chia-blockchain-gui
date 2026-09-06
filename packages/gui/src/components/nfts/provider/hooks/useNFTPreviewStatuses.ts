@@ -259,9 +259,13 @@ export default function useNFTPreviewStatuses(props: UseNFTPreviewStatusesProps)
   // the rest an outcome recorded under the old gateway settles nothing, so
   // the NFT shows up for its tile to re-request the file through the new
   // gateway — or, with the option now off, is classified from what the
-  // cache holds. An NFT whose metadata failed to load is forgotten too: the
-  // metadata store retries failed fetches on the same change, and the
-  // preview uris the metadata brings are unknown until it arrives.
+  // cache holds. An NFT whose metadata is not known is forgotten too — one
+  // whose metadata failed to load, and one whose metadata is being fetched:
+  // the metadata store retries failed fetches on the same change, and its
+  // effect runs before this one, so by the time an NFT is looked at here its
+  // failure has usually already become a fetch in flight. Either way the
+  // preview uris the metadata brings are unknown until it arrives, and a
+  // verdict reached without them must not outlive the change.
   const lastIpfsGatewayKeyRef = useRef(ipfsGatewayKey);
   useEffect(() => {
     if (lastIpfsGatewayKeyRef.current === ipfsGatewayKey) {
@@ -273,8 +277,8 @@ export default function useNFTPreviewStatuses(props: UseNFTPreviewStatusesProps)
     const reconsider = (nft: NFTInfo, nftId: string) => {
       const metadataState = getMetadata(nftId);
       const ipfsUrls = getNFTPreviewUrls(nft, metadataState).filter(isIpfsUrl);
-      const isMetadataFailed = !metadataState.isLoading && !metadataState.metadata && !!metadataState.error;
-      if (!ipfsUrls.length && !isMetadataFailed) {
+      const isMetadataUnknown = metadataState.isLoading || (!metadataState.metadata && !!metadataState.error);
+      if (!ipfsUrls.length && !isMetadataUnknown) {
         return;
       }
 
