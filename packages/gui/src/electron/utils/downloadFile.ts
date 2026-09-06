@@ -78,6 +78,11 @@ class WriteStreamPromise {
 // from this module.
 export { MAX_FILE_SIZE_EXCEEDED_ERROR, isDownloadTimeoutError, isTransientDownloadError };
 
+// The absolute cap on one transfer unless the caller sets its own. Sized for
+// videos on slow hosts; the inactivity timeout alone would let a host that
+// trickles bytes hold a download slot forever.
+export const DEFAULT_DOWNLOAD_MAX_DURATION = 30 * 60 * 1000; // 30 minutes
+
 type DownloadFileOptions = {
   timeout?: number;
   maxDuration?: number; // absolute cap on the whole transfer
@@ -101,7 +106,7 @@ export default async function downloadFile(
   localPath: string,
   {
     timeout = 30_000,
-    maxDuration = 30 * 60 * 1000,
+    maxDuration = DEFAULT_DOWNLOAD_MAX_DURATION,
     signal,
     maxSize = 100 * 1024 * 1024,
     onProgress,

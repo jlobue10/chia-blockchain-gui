@@ -139,7 +139,10 @@ export function getIpfsPath(url: string): string | undefined {
 // its CID just like an ipfs:// URI does, so when its host stops serving it
 // the same bytes can be fetched from any other gateway and still verified
 // against the on-chain hash. Returns the `<CID>[/path]` part, or undefined
-// for URLs that do not point at IPFS content.
+// for URLs that do not point at IPFS content — including any whose path is
+// not a CID path (see isIpfsPath): the host is whatever the minter chose, and
+// the extracted text is re-requested from the user's gateway, so it gets the
+// same scrutiny as the path of an ipfs:// URI.
 const PATH_GATEWAY = /^https?:\/\/[^/?#]+\/ipfs\/([^?#]+)$/i;
 const SUBDOMAIN_GATEWAY = /^https?:\/\/([a-z0-9]+)\.ipfs\.[^/?#]+(\/[^?#]*)?$/i;
 
@@ -148,19 +151,20 @@ export function getIpfsPathFromGatewayUrl(url: string): string | undefined {
     return undefined;
   }
 
+  let ipfsPath: string | undefined;
+
   const pathMatch = PATH_GATEWAY.exec(url);
   if (pathMatch) {
-    const ipfsPath = pathMatch[1].replace(/\/+$/, '');
-    return ipfsPath.length > 0 ? ipfsPath : undefined;
+    ipfsPath = pathMatch[1].replace(/\/+$/, '');
+  } else {
+    const subdomainMatch = SUBDOMAIN_GATEWAY.exec(url);
+    if (subdomainMatch) {
+      const [, cid, path = ''] = subdomainMatch;
+      ipfsPath = `${cid}${path.replace(/\/+$/, '')}`;
+    }
   }
 
-  const subdomainMatch = SUBDOMAIN_GATEWAY.exec(url);
-  if (subdomainMatch) {
-    const [, cid, path = ''] = subdomainMatch;
-    return `${cid}${path.replace(/\/+$/, '')}`;
-  }
-
-  return undefined;
+  return ipfsPath !== undefined && ipfsPath.length > 0 && isIpfsPath(ipfsPath) ? ipfsPath : undefined;
 }
 
 // The `<CID>[/path]` behind any URL that names IPFS content — an ipfs:// URI

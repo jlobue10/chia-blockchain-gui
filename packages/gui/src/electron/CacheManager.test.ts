@@ -18,8 +18,12 @@ jest.mock('./utils/downloadFile', () => ({
   __esModule: true,
   default: mockDownloadFile,
   MAX_FILE_SIZE_EXCEEDED_ERROR: 'Maximum file size exceeded',
+  DEFAULT_DOWNLOAD_MAX_DURATION: jest.requireActual('./utils/downloadFile').DEFAULT_DOWNLOAD_MAX_DURATION,
   isTransientDownloadError: jest.requireActual('./utils/downloadFile').isTransientDownloadError,
 }));
+
+const { DEFAULT_DOWNLOAD_MAX_DURATION } =
+  jest.requireActual<typeof import('./utils/downloadFile')>('./utils/downloadFile');
 
 jest.mock('./utils/ipcMainHandle', () => ({
   __esModule: true,
@@ -644,6 +648,20 @@ describe('CacheManager eviction', () => {
       'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png',
       'Maximum file size exceeded',
     ],
+    // the text after /ipfs/ is not a CID path, so there is nothing a gateway
+    // could serve — and appended to a local gateway it would name a path on
+    // this machine
+    ['a gateway-looking link whose path leaves /ipfs/', 'https://attacker.example/ipfs/../../admin', 'HTTP error: 500'],
+    [
+      'a gateway-looking link with an encoded dot segment',
+      'https://attacker.example/ipfs/%2e%2e/%2e%2e/api/v0/shutdown',
+      'HTTP error: 500',
+    ],
+    [
+      'a subdomain-style link whose path leaves /ipfs/',
+      'https://abc.ipfs.attacker.example/../../debug/vars',
+      'HTTP error: 500',
+    ],
   ])('does not fall back to the gateway for %s', async (_label, url, message) => {
     mockDownloadFile.mockRejectedValue(new Error(message));
 
@@ -655,6 +673,65 @@ describe('CacheManager eviction', () => {
 
     await expect(cacheManager.getContent(url)).rejects.toThrow(message);
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives the gateway fallback only what is left of the download deadline', async () => {
+    const payload = Buffer.from('cached payload');
+    const url = 'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const firstLegDuration = 10 * 60 * 1000;
+    mockDownloadFile
+      .mockImplementationOnce(async () => {
+        now += firstLegDuration;
+        throw new Error('Request timed out after 30000ms of inactivity');
+      })
+      .mockImplementationOnce(async (_url, localPath) => {
+        await fs.writeFile(localPath, payload);
+        return {
+          'content-type': 'image/png',
+        };
+      });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    try {
+      await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+      expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+      expect(mockDownloadFile.mock.calls[0][2]).toMatchObject({ maxDuration: DEFAULT_DOWNLOAD_MAX_DURATION });
+      expect(mockDownloadFile.mock.calls[1][2]).toMatchObject({
+        maxDuration: DEFAULT_DOWNLOAD_MAX_DURATION - firstLegDuration,
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('does not fall back to the gateway once the host has used up the whole download deadline', async () => {
+    const url = 'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    mockDownloadFile.mockImplementation(async () => {
+      now += DEFAULT_DOWNLOAD_MAX_DURATION;
+      throw new Error(`Request exceeded the ${DEFAULT_DOWNLOAD_MAX_DURATION}ms download deadline`);
+    });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    try {
+      await expect(cacheManager.getContent(url)).rejects.toThrow('download deadline');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('does not fall back to the gateway while the gateway option is off, and gives the link its fallback once it is on', async () => {

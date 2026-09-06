@@ -21,7 +21,11 @@ import ipfsToGatewayUrl, {
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
-import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
+import downloadFile, {
+  DEFAULT_DOWNLOAD_MAX_DURATION,
+  MAX_FILE_SIZE_EXCEEDED_ERROR,
+  isTransientDownloadError,
+} from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -560,9 +564,16 @@ export default class CacheManager extends EventEmitter {
         const limitedRemoteFileDownload = async (): Promise<CacheInfo> => {
           const cacheFilePath = this.getCacheFilePath(url);
 
+          // One deadline for the whole slot, shared by the download and its
+          // gateway fallback: a host that held the connection for the full
+          // duration has already cost the most one URL may, and must not
+          // earn the gateway a second full-length attempt on top.
+          const deadline = Date.now() + DEFAULT_DOWNLOAD_MAX_DURATION;
+
           const downloadOptions = {
             timeout,
             maxSize,
+            maxDuration: DEFAULT_DOWNLOAD_MAX_DURATION,
             signal: abortController.signal,
             overrideFile: true,
             gatewayBase: requestGateway,
@@ -577,15 +588,22 @@ export default class CacheManager extends EventEmitter {
             // host fails (gone, rate limiting, challenging the request) the
             // same bytes can be fetched through the user's gateway and are
             // still verified against the on-chain hash. Only when the option
-            // is on, the host is not already that gateway, and the failure is
-            // the host's — not an abort, a size cap, or the option itself.
-            const fallbackUrl = this.getGatewayFallbackUrl(url, requestGateway, downloadError as Error);
+            // is on, the host is not already that gateway, the failure is
+            // the host's — not an abort, a size cap, or the option itself —
+            // and the shared deadline has time left.
+            const timeLeft = deadline - Date.now();
+            const fallbackUrl =
+              timeLeft > 0 ? this.getGatewayFallbackUrl(url, requestGateway, downloadError as Error) : undefined;
             if (!fallbackUrl) {
               throw downloadError;
             }
 
             log(`Download failed (${(downloadError as Error).message}), retrying through the gateway`, url);
-            headers = await downloadFile(url, cacheFilePath, { ...downloadOptions, requestUrl: fallbackUrl });
+            headers = await downloadFile(url, cacheFilePath, {
+              ...downloadOptions,
+              requestUrl: fallbackUrl,
+              maxDuration: timeLeft,
+            });
           }
 
           log('Download finished', url);

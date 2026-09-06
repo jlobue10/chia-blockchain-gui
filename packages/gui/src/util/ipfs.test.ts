@@ -279,6 +279,24 @@ describe('getIpfsPathFromGatewayUrl', () => {
     expect(getIpfsPathFromGatewayUrl(`ipfs://${CID_V1}`)).toBeUndefined();
     expect(getIpfsPathFromGatewayUrl('')).toBeUndefined();
   });
+
+  // Any host may carry /ipfs/ in a URL, and the text after it is refetched
+  // from the user's gateway, so it gets the same CID-path check as an ipfs://
+  // URI: a path that would leave /ipfs/ — on a local gateway, a path on this
+  // machine — is not IPFS content.
+  it.each([
+    'https://attacker.example/ipfs/../../admin',
+    'https://attacker.example/ipfs/../api/v0/id',
+    'https://attacker.example/ipfs/%2e%2e/%2e%2e/api/v0/shutdown',
+    `https://attacker.example/ipfs/${CID_V1}/../../admin`,
+    `https://attacker.example/ipfs/${CID_V1}//admin`,
+    'https://attacker.example/ipfs/not a cid',
+    'https://attacker.example/ipfs/-/x',
+    `https://abc.ipfs.attacker.example/../../debug/vars`,
+    `https://${CID_V1}.ipfs.dweb.link/%2e%2e/x`,
+  ])('returns undefined for %p, whose path is not a CID path', (url) => {
+    expect(getIpfsPathFromGatewayUrl(url)).toBeUndefined();
+  });
 });
 
 describe('getIpfsPathFromAnyUrl / isIpfsBackedUrl', () => {
