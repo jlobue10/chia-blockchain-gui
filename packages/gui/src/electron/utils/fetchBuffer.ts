@@ -4,6 +4,7 @@ import type Headers from '../../@types/Headers';
 
 import { toFetchableUrl } from './ipfsGateway';
 import isValidURL, { isValidRequestURL } from './isValidURL';
+import guardRedirects from './redirectPolicy';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_MAX_SIZE = 100 * 1024 * 1024; // 100 MB
@@ -53,6 +54,8 @@ export default async function fetchBuffer(
     method: 'GET',
     url: requestUrl,
     headers,
+    // each redirect is checked against the same rule as the requested URL
+    redirect: 'manual',
   });
 
   return new Promise<FetchBufferResult>((resolve, reject) => {
@@ -147,6 +150,11 @@ export default async function fetchBuffer(
 
     request.on('abort', () => {
       rejectOnce(new Error('Request aborted'));
+    });
+
+    guardRedirects(request, requestUrl, (error) => {
+      rejectOnce(error);
+      request.abort();
     });
 
     request.end();

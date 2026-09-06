@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -52,7 +53,10 @@ describe('downloadFile', () => {
       }),
     ).rejects.toThrow('HTTP error: 404');
 
-    expect(mockNetRequest).toHaveBeenCalledWith(`http://127.0.0.1:8080/ipfs/${CID}/img.png`);
+    expect(mockNetRequest).toHaveBeenCalledWith({
+      url: `http://127.0.0.1:8080/ipfs/${CID}/img.png`,
+      redirect: 'manual',
+    });
   });
 
   // The URL that leaves the machine is the gateway form, not the ipfs URI the
@@ -88,6 +92,59 @@ describe('downloadFile', () => {
     ).rejects.toThrow('Request aborted');
 
     expect(mockNetRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe('downloadFile redirects', () => {
+  type MockRequest = EventEmitter & { end: jest.Mock; abort: jest.Mock; followRedirect: jest.Mock };
+  let request: MockRequest;
+
+  function makeResponse(statusCode = 200, headers: Record<string, string> = { 'content-type': 'image/png' }) {
+    return Object.assign(new EventEmitter(), { statusCode, headers });
+  }
+
+  beforeEach(() => {
+    request = Object.assign(new EventEmitter(), { end: jest.fn(), abort: jest.fn(), followRedirect: jest.fn() });
+    request.abort.mockImplementation(() => {
+      request.emit('abort');
+    });
+    mockNetRequest.mockReturnValue(request);
+  });
+
+  it('asks for manual redirects and follows one that stays on https', async () => {
+    const localPath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'downloadFile-redirect-')), 'nft.png');
+    const download = downloadFile('https://minter.example/a.png', localPath);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(mockNetRequest).toHaveBeenCalledWith({ url: 'https://minter.example/a.png', redirect: 'manual' });
+
+    request.emit('redirect', 302, 'GET', 'https://cdn.example/a.png', {});
+    expect(request.followRedirect).toHaveBeenCalledTimes(1);
+
+    const response = makeResponse();
+    request.emit('response', response);
+    response.emit('data', Buffer.from('png bytes'));
+    response.emit('end');
+
+    await expect(download).resolves.toEqual({ 'content-type': 'image/png' });
+    expect((await fs.readFile(localPath)).toString()).toBe('png bytes');
+  });
+
+  it('refuses a redirect to a plain-http loopback address and settles permanently', async () => {
+    const localPath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'downloadFile-redirect-')), 'nft.png');
+    const download = downloadFile('https://minter.example/a.png', localPath);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+    request.emit('redirect', 302, 'GET', 'http://127.0.0.1:8080/api/v0/shutdown', {});
+    expect(request.followRedirect).not.toHaveBeenCalled();
+    expect(request.abort).toHaveBeenCalled();
+
+    await expect(download).rejects.toThrow('Redirect refused');
+    expect(isTransientDownloadError('Redirect refused')).toBe(false);
+    await expect(fs.stat(`${localPath}.tmp`)).rejects.toThrow();
   });
 });
 
