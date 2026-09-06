@@ -4,11 +4,19 @@ import { promises as fs, createWriteStream, type WriteStream } from 'node:fs';
 import debug from 'debug';
 
 import type Headers from '../../@types/Headers';
+import {
+  DOWNLOAD_DEADLINE_ERROR_PREFIX,
+  INACTIVITY_TIMEOUT_ERROR_PREFIX,
+  MAX_FILE_SIZE_EXCEEDED_ERROR,
+  isDownloadTimeoutError,
+  isTransientDownloadError,
+} from '../../util/downloadErrors';
 
 import { DEFAULT_DOWNLOAD_MAX_DURATION } from './DownloadDeadline';
 import fileExists from './fileExists';
 import { toFetchableUrl } from './ipfsGateway';
-import isValidURL from './isValidURL';
+import isValidURL, { isValidRequestURL } from './isValidURL';
+import getRequestUserAgent from './requestUserAgent';
 
 const log = debug('chia-gui:downloadFile');
 
@@ -65,16 +73,16 @@ class WriteStreamPromise {
   }
 }
 
-export const MAX_FILE_SIZE_EXCEEDED_ERROR = 'Maximum file size exceeded';
+// The error classification lives in util/downloadErrors so the renderer's
+// gallery classifier reads persisted failures the same way the main process
+// does; re-exported here for the main-process callers that always imported it
+// from this module.
+export { MAX_FILE_SIZE_EXCEEDED_ERROR, isDownloadTimeoutError, isTransientDownloadError };
 
-const INACTIVITY_TIMEOUT_ERROR_PREFIX = 'Request timed out after';
-const DOWNLOAD_DEADLINE_ERROR_PREFIX = 'Request exceeded the';
-
-/** Matches the messages of both timeout errors below, including messages that
- * earlier sessions persisted into cache `-info` files. */
-export function isDownloadTimeoutError(message: string): boolean {
-  return message.startsWith(INACTIVITY_TIMEOUT_ERROR_PREFIX) || message.startsWith(DOWNLOAD_DEADLINE_ERROR_PREFIX);
-}
+// The absolute cap on one transfer unless the caller sets its own. Sized for
+// videos on slow hosts; the inactivity timeout alone would let a host that
+// trickles bytes hold a download slot forever.
+export { DEFAULT_DOWNLOAD_MAX_DURATION };
 
 type DownloadFileOptions = {
   timeout?: number;
@@ -83,6 +91,15 @@ type DownloadFileOptions = {
   maxSize?: number; // values <= 0 disable the size limit
   onProgress?: (progress: number, size: number, downloadedSize: number) => void;
   overrideFile?: boolean;
+  // the gateway base an ipfs:// url is fetched through; defaults to the
+  // current preference (see toFetchableUrl)
+  gatewayBase?: string;
+  // the URL to actually request instead of `url` — the caller keeps `url` as
+  // its cache key while fetching the same content from elsewhere (an IPFS
+  // gateway URL whose own host failed, refetched through the configured
+  // gateway); must itself be an https URL or a plain-http one on this
+  // machine, the forms the gateway setting accepts
+  requestUrl?: string;
 };
 
 export default async function downloadFile(
@@ -95,6 +112,8 @@ export default async function downloadFile(
     maxSize = 100 * 1024 * 1024,
     onProgress,
     overrideFile = false,
+    gatewayBase,
+    requestUrl,
   }: DownloadFileOptions = {},
 ): Promise<Headers> {
   if (!isValidURL(url)) {
@@ -110,13 +129,20 @@ export default async function downloadFile(
     throw new Error('Request aborted');
   }
 
-  const tempFilePath = `${localPath}.tmp`;
   // ipfs:// URIs are fetched through an HTTPS gateway when the user has
   // enabled it — Electron's net stack cannot request the ipfs scheme, and
   // with the option off toFetchableUrl refuses the fetch outright. Only
   // this outgoing request uses the translated URL; callers keep the original
-  // URI as the cache key.
-  const request = net.request(toFetchableUrl(url));
+  // URI as the cache key. The translated URL is what actually leaves the
+  // machine, so it is the string that gets validated.
+  const fetchUrl = toFetchableUrl(requestUrl ?? url, gatewayBase);
+  if (!isValidRequestURL(fetchUrl)) {
+    throw new Error('Invalid URL');
+  }
+
+  const tempFilePath = `${localPath}.tmp`;
+  const request = net.request(fetchUrl);
+  request.setHeader('User-Agent', getRequestUserAgent());
   const outputStream = new WriteStreamPromise(tempFilePath, overrideFile);
 
   // set when we abort the request ourselves, so abort events can be reported
@@ -207,7 +233,11 @@ export default async function downloadFile(
         throw error ?? new Error('Unknown error');
       } catch (e) {
         log('Download failed', url, (e as Error)?.message);
-        // Failed cleanup must not prevent rejection and leak a limiter slot.
+        // The temp file may never have been created (the stream failed to
+        // open) or may already be gone. Cleanup must not decide whether the
+        // promise settles: this runs from fire-and-forget event handlers, so a
+        // throw here would leave the caller — and its download slot — waiting
+        // forever.
         await fs.unlink(tempFilePath).catch(() => {});
         reject(e);
       }
@@ -282,6 +312,9 @@ export default async function downloadFile(
       resolvePromise(false, error);
     });
 
+    // A write stream that cannot open its file (missing cache directory, no
+    // permission, too many open files) reports it as an 'error' event; with no
+    // listener that is an uncaught exception in the main process.
     outputStream.on('error', (error: Error = new Error('Unknown write error')) => {
       resolvePromise(false, error);
       request.abort();
