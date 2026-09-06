@@ -266,16 +266,40 @@ describe('getIpfsPathFromGatewayUrl', () => {
     expect(getIpfsPathFromGatewayUrl(`https://${CID_V1}.ipfs.nftstorage.link`)).toBe(CID_V1);
   });
 
+  it('keeps the subdomain CID when the file path itself starts with /ipfs/', () => {
+    // a directory published under a CID may contain a folder called ipfs; the
+    // content is still the subdomain's CID, not whatever follows /ipfs/
+    expect(getIpfsPathFromGatewayUrl(`https://${CID_V1}.ipfs.dweb.link/ipfs/${CID_V0}/x.png`)).toBe(
+      `${CID_V1}/ipfs/${CID_V0}/x.png`,
+    );
+    // a path-style gateway whose hostname merely contains "ipfs" is not a
+    // subdomain gateway — its short label is no CID
+    expect(getIpfsPathFromGatewayUrl(`https://gw.ipfs.example.com/ipfs/${CID_V0}/x.png`)).toBe(`${CID_V0}/x.png`);
+  });
+
   it('keeps the path exactly as published', () => {
     expect(getIpfsPathFromGatewayUrl(`https://nftstorage.link/ipfs/${CID_V1}/image%20-%20one.jfif`)).toBe(
       `${CID_V1}/image%20-%20one.jfif`,
     );
   });
 
+  it('carries a query string along and drops a fragment', () => {
+    expect(getIpfsPathFromGatewayUrl(`https://example.com/ipfs/${CID_V1}?download=1`)).toBe(`${CID_V1}?download=1`);
+    expect(getIpfsPathFromGatewayUrl(`https://example.com/ipfs/${CID_V1}/a.png?filename=b.png#top`)).toBe(
+      `${CID_V1}/a.png?filename=b.png`,
+    );
+    expect(getIpfsPathFromGatewayUrl(`https://${CID_V1}.ipfs.dweb.link/a.png?x=1`)).toBe(`${CID_V1}/a.png?x=1`);
+    // the query never reaches the CID-path check, and the fallback URL keeps it
+    expect(ipfsToGatewayUrl(`ipfs://${CID_V1}?download=1`, 'http://127.0.0.1:8080/ipfs/')).toBe(
+      `http://127.0.0.1:8080/ipfs/${CID_V1}?download=1`,
+    );
+    expect(getIpfsPathFromGatewayUrl('https://example.com/ipfs/../../admin?x=1')).toBeUndefined();
+  });
+
   it('returns undefined for URLs that do not name IPFS content', () => {
     expect(getIpfsPathFromGatewayUrl('https://example.com/image.png')).toBeUndefined();
     expect(getIpfsPathFromGatewayUrl('https://example.com/ipfs/')).toBeUndefined();
-    expect(getIpfsPathFromGatewayUrl(`https://example.com/ipfs/${CID_V1}?download=1`)).toBeUndefined();
+    expect(getIpfsPathFromGatewayUrl('https://example.com/ipfs/?x=1')).toBeUndefined();
     expect(getIpfsPathFromGatewayUrl(`ipfs://${CID_V1}`)).toBeUndefined();
     expect(getIpfsPathFromGatewayUrl('')).toBeUndefined();
   });

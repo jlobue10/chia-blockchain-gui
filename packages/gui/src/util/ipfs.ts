@@ -142,9 +142,15 @@ export function getIpfsPath(url: string): string | undefined {
 // for URLs that do not point at IPFS content — including any whose path is
 // not a CID path (see isIpfsPath): the host is whatever the minter chose, and
 // the extracted text is re-requested from the user's gateway, so it gets the
-// same scrutiny as the path of an ipfs:// URI.
-const PATH_GATEWAY = /^https?:\/\/[^/?#]+\/ipfs\/([^?#]+)$/i;
-const SUBDOMAIN_GATEWAY = /^https?:\/\/([a-z0-9]+)\.ipfs\.[^/?#]+(\/[^?#]*)?$/i;
+// same scrutiny as the path of an ipfs:// URI. A query string is carried
+// along (a fragment is not: it is never sent). The subdomain form is tried
+// first, and only when the label is long enough to be a CID — CIDv1 in base32
+// or base36 is at least 46 characters, while `gw.ipfs.example.com` is a
+// path-style gateway whose hostname merely contains `ipfs` — so a subdomain
+// gateway serving a directory whose own path starts with `/ipfs/` keeps its
+// CID instead of being read as a path-style link to a different one.
+const SUBDOMAIN_GATEWAY = /^https?:\/\/([a-z0-9]{46,})\.ipfs\.[^/?#]+(\/[^?#]*)?(\?[^#]*)?(?:#.*)?$/i;
+const PATH_GATEWAY = /^https?:\/\/[^/?#]+\/ipfs\/([^?#]+)(\?[^#]*)?(?:#.*)?$/i;
 
 export function getIpfsPathFromGatewayUrl(url: string): string | undefined {
   if (typeof url !== 'string') {
@@ -152,19 +158,23 @@ export function getIpfsPathFromGatewayUrl(url: string): string | undefined {
   }
 
   let ipfsPath: string | undefined;
+  let query = '';
 
-  const pathMatch = PATH_GATEWAY.exec(url);
-  if (pathMatch) {
-    ipfsPath = pathMatch[1].replace(/\/+$/, '');
+  const subdomainMatch = SUBDOMAIN_GATEWAY.exec(url);
+  if (subdomainMatch) {
+    const [, cid, path = '', search = ''] = subdomainMatch;
+    ipfsPath = `${cid}${path.replace(/\/+$/, '')}`;
+    query = search;
   } else {
-    const subdomainMatch = SUBDOMAIN_GATEWAY.exec(url);
-    if (subdomainMatch) {
-      const [, cid, path = ''] = subdomainMatch;
-      ipfsPath = `${cid}${path.replace(/\/+$/, '')}`;
+    const pathMatch = PATH_GATEWAY.exec(url);
+    if (pathMatch) {
+      const [, path, search = ''] = pathMatch;
+      ipfsPath = path.replace(/\/+$/, '');
+      query = search;
     }
   }
 
-  return ipfsPath !== undefined && ipfsPath.length > 0 && isIpfsPath(ipfsPath) ? ipfsPath : undefined;
+  return ipfsPath !== undefined && ipfsPath.length > 0 && isIpfsPath(ipfsPath) ? `${ipfsPath}${query}` : undefined;
 }
 
 // The `<CID>[/path]` behind any URL that names IPFS content — an ipfs:// URI
