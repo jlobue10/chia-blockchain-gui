@@ -4,7 +4,8 @@ import { useCallback } from 'react';
 import type { CacheRequestOptions } from '../@types/CacheService';
 import type Metadata from '../@types/Metadata';
 import compareChecksums from '../util/compareChecksums';
-import { CHECKSUM_MISMATCH_ERROR, METADATA_URI_BUDGET_MS } from '../util/fetchMetadataFromUris';
+import { CHECKSUM_MISMATCH_ERROR, METADATA_MAX_SIZE, METADATA_URI_BUDGET_MS } from '../util/fetchMetadataFromUris';
+import normalizeMetadata from '../util/normalizeMetadata';
 import parseFileContent from '../util/parseFileContent';
 
 import useCache from './useCache';
@@ -22,6 +23,7 @@ export default function useFetchAndProcessMetadata() {
       const { checksum, headers, content } = await getContentWithInfo(uri, {
         ...options,
         maxDuration: options?.maxDuration ?? METADATA_URI_BUDGET_MS,
+        maxSize: options?.maxSize ?? METADATA_MAX_SIZE,
       });
 
       log(`Comparing checksums ${checksum} and ${hash}`);
@@ -30,7 +32,9 @@ export default function useFetchAndProcessMetadata() {
       }
 
       const metadataString = parseFileContent(content, headers);
-      return JSON.parse(metadataString) as Metadata;
+      // Whatever the file held, what leaves here has the shape the GUI relies on.
+      const metadata: Metadata = normalizeMetadata(JSON.parse(metadataString));
+      return metadata;
     },
     [getContentWithInfo /* immutable */],
   );
