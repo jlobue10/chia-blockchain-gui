@@ -18,9 +18,10 @@ jest.mock('./utils/downloadFile', () => ({
   __esModule: true,
   default: mockDownloadFile,
   MAX_FILE_SIZE_EXCEEDED_ERROR: 'Maximum file size exceeded',
-  TEMP_FILE_SUFFIX: '.tmp',
   DEFAULT_DOWNLOAD_MAX_DURATION: jest.requireActual('./utils/downloadFile').DEFAULT_DOWNLOAD_MAX_DURATION,
   isTransientDownloadError: jest.requireActual('./utils/downloadFile').isTransientDownloadError,
+  TEMP_FILE_SUFFIX: '.tmp',
+  isDownloadTimeoutError: jest.requireActual('./utils/downloadFile').isDownloadTimeoutError,
 }));
 
 const { DEFAULT_DOWNLOAD_MAX_DURATION } =
@@ -61,8 +62,6 @@ async function untilDownloadsStarted(count: number) {
   expect(mockDownloadFile).toHaveBeenCalledTimes(count);
 }
 
-// The download starts only after the sidecar has been read, so a test that
-// interferes with an in-flight download has to wait for it to actually start.
 describe('CacheManager eviction', () => {
   let cacheDirectory: string;
 

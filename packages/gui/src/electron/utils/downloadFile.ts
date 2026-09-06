@@ -79,15 +79,14 @@ class WriteStreamPromise {
 // from this module.
 export { MAX_FILE_SIZE_EXCEEDED_ERROR, isDownloadTimeoutError, isTransientDownloadError };
 
-// A download streams into `<localPath>.tmp` and is renamed into place once it
-// completes, so a partial file is never served. CacheManager accounts for,
-// evicts and sweeps these files by the same suffix.
-export const TEMP_FILE_SUFFIX = '.tmp';
-
 // The absolute cap on one transfer unless the caller sets its own. Sized for
 // videos on slow hosts; the inactivity timeout alone would let a host that
 // trickles bytes hold a download slot forever.
 export { DEFAULT_DOWNLOAD_MAX_DURATION };
+// A download streams into `<localPath>.tmp` and is renamed into place once it
+// completes, so a partial file is never served. CacheManager accounts for,
+// evicts and sweeps these files by the same suffix.
+export const TEMP_FILE_SUFFIX = '.tmp';
 
 type DownloadFileOptions = {
   timeout?: number;

@@ -173,6 +173,13 @@ export default class CacheManager extends EventEmitter {
     }
   > = new Map();
 
+  // URLs whose download failed transiently during this session. A persisted
+  // transient failure is retried once per session and again whenever the retry
+  // delay has elapsed since it was recorded — the set keeps a stalled or
+  // challenging host from being retried (and holding a download slot) on every
+  // access in between.
+  private transientFailureUrls: Set<string> = new Set();
+
   // Clear, migration and invalidation share one barrier. Waiters must not enter
   // the request map until admitted: maintenance drains that map, so a request
   // which itself awaits maintenance would create a circular wait.
@@ -180,12 +187,10 @@ export default class CacheManager extends EventEmitter {
 
   private clearing: Promise<void> | undefined;
 
-  // URLs whose download failed transiently during this session. A persisted
-  // transient failure is retried once per session and again whenever the retry
-  // delay has elapsed since it was recorded — the set keeps a stalled or
-  // challenging host from being retried (and holding a download slot) on every
-  // access in between.
-  private transientFailureUrls: Set<string> = new Set();
+  private maintenanceGeneration = 0;
+
+  // Only disk reads enter this map; they never wait for maintenance or fetches.
+  private activeReads = new Map<Promise<Buffer>, { url: string; filePath: string }>();
 
   constructor(
     options: {
@@ -865,35 +870,60 @@ export default class CacheManager extends EventEmitter {
   }
 
   async getContent(url: string, options?: CacheRequestOptions): Promise<Buffer> {
-    if (!isValidURL(url)) {
-      throw new Error(`Invalid URL: ${url}`);
-    }
+    return (await this.getContentWithInfo(url, options)).content;
+  }
 
-    const cacheInfo = await this.fetchRemoteContent(url, options);
-
-    if (cacheInfo.state === CacheState.ERROR) {
-      throw new Error(cacheInfo.error);
-    }
-
-    if (cacheInfo.state === CacheState.NOT_CACHED) {
-      throw new Error('Url is not cached');
-    }
-
-    if (cacheInfo.state === CacheState.CACHED) {
-      if (this.maintenance) {
-        // Maintenance began after the lookup settled, so what it found is
-        // stale: the file may be gone, or live in another directory
-        // by the time it is read. Look again once the maintenance is done —
-        // a cleared entry is fetched afresh rather than read from nowhere.
+  // Keep bytes, headers and checksum from one stable cache decision. A clear,
+  // invalidation or migration can overtake the lookup, even finish before its
+  // continuation resumes. A generation check detects that completed operation.
+  async getContentWithInfo(
+    url: string,
+    options: CacheRequestOptions = {},
+  ): Promise<CacheContent & { content: Buffer }> {
+    const budget = { remaining: normalizeDownloadDuration(options.maxDuration) };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const generation = this.maintenanceGeneration;
+      // eslint-disable-next-line no-await-in-loop -- Recheck a decision overtaken by maintenance.
+      const cacheInfo = await this.fetchRemoteContent(url, options, budget);
+      if (cacheInfo.state === CacheState.ERROR) {
+        throw new Error(cacheInfo.error);
+      }
+      if (cacheInfo.state !== CacheState.CACHED) {
+        throw new Error('Url is not cached');
+      }
+      if (this.maintenance || generation !== this.maintenanceGeneration) {
+        // eslint-disable-next-line no-await-in-loop -- Wait outside the drained request/read maps.
         await this.waitForMaintenance();
-        return this.getContent(url, options);
+        // eslint-disable-next-line no-continue -- The completed maintenance invalidated this lookup.
+        continue;
       }
 
       const filePath = this.getCacheFilePath(url);
-      return fs.readFile(filePath);
+      const read = fs.readFile(filePath);
+      // Register synchronously after the generation check. Maintenance waits
+      // for this read before touching its files; eviction also skips the path.
+      this.activeReads.set(read, { url, filePath });
+      try {
+        // eslint-disable-next-line no-await-in-loop -- Read only the stable decision's bytes.
+        const content = await read;
+        return {
+          content,
+          headers: cacheInfo.headers,
+          checksum: crypto.createHash('sha256').update(content).digest('hex'),
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error;
+        }
+      } finally {
+        this.activeReads.delete(read);
+      }
+      // An external deletion or a completed eviction may leave an orphaned
+      // sidecar. Drop it before one bounded retry, using the remaining budget.
+      // eslint-disable-next-line no-await-in-loop -- Repair the missing entry before retrying.
+      await this.invalidate(url);
     }
-
-    throw new Error('Unknown cache state');
+    throw new Error('Cache changed repeatedly while reading; please retry');
   }
 
   // Waits out every maintenance operation (clear, migration, invalidation) in
@@ -904,30 +934,6 @@ export default class CacheManager extends EventEmitter {
       // eslint-disable-next-line no-await-in-loop -- another operation may have been queued while this one ran
       await this.maintenance.catch(() => {});
     }
-  }
-
-  // Metadata needs headers, checksum and bytes from ONE download decision.
-  // Three independent calls could re-download after eviction/invalidation,
-  // spending an attempt's transfer allowance three times. Hash the bytes we
-  // return so a concurrent replacement cannot pair new bytes with an old hash.
-  async getContentWithInfo(url: string, options?: CacheRequestOptions): Promise<CacheContent> {
-    const cacheInfo = await this.fetchRemoteContent(url, options);
-    if (cacheInfo.state === CacheState.ERROR) {
-      throw new Error(cacheInfo.error);
-    }
-    if (cacheInfo.state !== CacheState.CACHED) {
-      throw new Error('Url is not cached');
-    }
-    while (this.maintenance) {
-      // eslint-disable-next-line no-await-in-loop -- Read the completed destination, not a half-migrated pair.
-      await this.maintenance.catch(() => {});
-    }
-    const content = await fs.readFile(this.getCacheFilePath(url));
-    return {
-      content,
-      headers: cacheInfo.headers,
-      checksum: crypto.createHash('sha256').update(content).digest('hex'),
-    };
   }
 
   async getChecksum(url: string, options?: CacheRequestOptions): Promise<string> {
@@ -1031,6 +1037,7 @@ export default class CacheManager extends EventEmitter {
   // reported to its caller but must not poison subsequent maintenance/fetches.
   // Invalidation drains only its URL; clear and migration must drain them all.
   private runMaintenance(operation: () => Promise<void>, url?: string): Promise<void> {
+    this.maintenanceGeneration += 1;
     const previous = this.maintenance ?? Promise.resolve();
     const pending = previous
       .catch(() => {})
@@ -1039,7 +1046,10 @@ export default class CacheManager extends EventEmitter {
           .filter(([requestUrl]) => url === undefined || requestUrl === url)
           .map(([, request]) => request);
         ongoing.forEach((request) => request.abort());
-        await Promise.allSettled(ongoing.map((request) => request.promise));
+        const reads = Array.from(this.activeReads.entries())
+          .filter(([, read]) => url === undefined || read.url === url)
+          .map(([read]) => read);
+        await Promise.allSettled([...ongoing.map((request) => request.promise), ...reads]);
         await operation();
       });
     this.maintenance = pending;
@@ -1229,7 +1239,8 @@ export default class CacheManager extends EventEmitter {
         break;
       }
 
-      if (fileStat.filePath !== preserveFilePath && !inFlight.has(fileStat.filePath)) {
+      const beingRead = Array.from(this.activeReads.values()).some((read) => read.filePath === fileStat.filePath);
+      if (fileStat.filePath !== preserveFilePath && !inFlight.has(fileStat.filePath) && !beingRead) {
         totalSize -= fileStat.size;
         filesToRemove.push(fileStat);
       }
