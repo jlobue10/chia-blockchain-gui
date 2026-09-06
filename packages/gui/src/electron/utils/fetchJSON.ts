@@ -1,7 +1,7 @@
 import { net, IncomingMessage } from 'electron';
 
 import { toFetchableUrl } from './ipfsGateway';
-import isValidURL from './isValidURL';
+import isValidURL, { isValidRequestURL } from './isValidURL';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_MAX_SIZE = 100 * 1024 * 1024; // 100 MB
@@ -16,12 +16,18 @@ export default async function fetchJSON<TData>(
     throw new Error('Invalid URL');
   }
 
+  // ipfs:// URIs are fetched through an HTTPS gateway when the user has
+  // enabled it — Electron's net stack cannot request the ipfs scheme, and
+  // with the option off toFetchableUrl refuses the fetch outright. The
+  // translated URL is the one that leaves the machine, so it is validated too.
+  const requestUrl = toFetchableUrl(url);
+  if (!isValidRequestURL(requestUrl)) {
+    throw new Error('Invalid URL');
+  }
+
   const request = net.request({
     method,
-    // ipfs:// URIs are fetched through an HTTPS gateway when the user has
-    // enabled it — Electron's net stack cannot request the ipfs scheme, and
-    // with the option off toFetchableUrl refuses the fetch outright.
-    url: toFetchableUrl(url),
+    url: requestUrl,
     headers,
   });
 

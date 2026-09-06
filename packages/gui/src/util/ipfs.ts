@@ -16,6 +16,34 @@ export const NFT_IPFS_GATEWAY_URL_PREF = 'nftIpfsGatewayUrl';
 // https like every other NFT resource URL.
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
+// An http or https URL on this machine — the one kind of URL the gateway
+// setting accepts that the general NFT URL check (electron/utils/isValidURL)
+// would refuse: it may be plain http and its host has no top-level domain.
+export function isLoopbackUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && LOOPBACK_HOSTS.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+// Whether a gateway host will pass the check every outgoing request goes
+// through (validator's isURL: an IP address, or a name with a top-level
+// domain). A gateway that fails it would be accepted here and then fail every
+// fetch with "Invalid URL", so it is refused up front instead.
+const IPV4_HOST = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+const HOST_WITH_TLD = /\.(?:[a-z¡-￿]{2,}|xn--[a-z0-9-]+)$/i;
+
+function isRequestableGatewayHost(hostname: string): boolean {
+  return (
+    LOOPBACK_HOSTS.has(hostname) ||
+    hostname.startsWith('[') || // IPv6 literal
+    IPV4_HOST.test(hostname) ||
+    HOST_WITH_TLD.test(hostname)
+  );
+}
+
 // Turns whatever the user typed into the base every ipfs path is appended
 // to: `https://dweb.link`, `https://dweb.link/ipfs` and `https://dweb.link/ipfs/`
 // all become `https://dweb.link/ipfs/`. Returns undefined for anything that
@@ -42,7 +70,7 @@ export function normalizeIpfsGatewayBase(input: string | undefined | null): stri
 
   const isHttps = parsed.protocol === 'https:';
   const isLoopbackHttp = parsed.protocol === 'http:' && LOOPBACK_HOSTS.has(parsed.hostname);
-  if ((!isHttps && !isLoopbackHttp) || !parsed.hostname) {
+  if ((!isHttps && !isLoopbackHttp) || !parsed.hostname || !isRequestableGatewayHost(parsed.hostname)) {
     return undefined;
   }
 
@@ -61,26 +89,60 @@ export function isIpfsUrl(url: string): boolean {
   return typeof url === 'string' && IPFS_SCHEME.test(url);
 }
 
+// A CID is base58btc (v0) or base32/base36 (v1): letters and digits only.
+const CID_SEGMENT = /^[A-Za-z0-9]+$/;
+// One segment of a URL path (RFC 3986 pchar, percent-encoded bytes included).
+// No `/`, `\`, `?`, `#` or whitespace: the segment is appended to a gateway
+// base and must stay one segment of the path under it.
+const PATH_SEGMENT = /^[A-Za-z0-9._~!$&'()*+,;=:@%-]+$/;
+// `.`, `..` and their percent-encoded spellings, which URL resolution walks
+// back up — out of the gateway's /ipfs/ prefix.
+const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
+
+// Whether `<CID>[/path]` names IPFS content and nothing else. The value comes
+// from NFT data the minter wrote and ends up appended to a gateway base, so
+// a first segment that is not a CID, or any segment that would resolve
+// somewhere other than under the base, disqualifies the whole path.
+export function isIpfsPath(ipfsPath: string): boolean {
+  const [cid, ...segments] = ipfsPath.split('/');
+
+  return CID_SEGMENT.test(cid) && segments.every((segment) => PATH_SEGMENT.test(segment) && !DOT_SEGMENT.test(segment));
+}
+
 // Returns the `<CID>[/path]` part of an ipfs:// URI, tolerating the redundant
 // `ipfs://ipfs/<CID>` form produced by some minting tools. CIDv0 hashes are
-// case-sensitive base58, so the value is never case-normalized.
+// case-sensitive base58, so the value is never case-normalized. A query string
+// is kept; a trailing slash is dropped. Returns undefined when what follows
+// the scheme does not name IPFS content (see isIpfsPath), so the URI is
+// treated like any other URL the gateway cannot serve.
 export function getIpfsPath(url: string): string | undefined {
   if (!isIpfsUrl(url)) {
     return undefined;
   }
 
-  const ipfsPath = url.replace(IPFS_SCHEME, '').replace(/^ipfs\//i, '');
+  const [, ipfsPath, query] = /^([^?#]*)(.*)$/s.exec(url.replace(IPFS_SCHEME, '').replace(/^ipfs\//i, '')) ?? [];
+  const trimmedPath = ipfsPath.replace(/\/+$/, '');
 
-  return ipfsPath.length > 0 ? ipfsPath : undefined;
+  return trimmedPath.length > 0 && isIpfsPath(trimmedPath) ? `${trimmedPath}${query}` : undefined;
 }
 
 // Translates an ipfs:// URI to its HTTPS gateway equivalent. Anything else
 // (including an unusable bare `ipfs://`) is returned unchanged, so this can
 // wrap any URL right where it reaches the network layer. `gatewayBase` is a
 // normalized base (see normalizeIpfsGatewayBase); it defaults to the public
-// gateway.
+// gateway. Whatever the path looked like, the URL handed back resolves under
+// the base — an ipfs URI that would land anywhere else is returned unchanged
+// and so fails validation.
 export default function ipfsToGatewayUrl(url: string, gatewayBase: string = DEFAULT_IPFS_GATEWAY_BASE): string {
   const ipfsPath = getIpfsPath(url);
+  if (ipfsPath === undefined) {
+    return url;
+  }
 
-  return ipfsPath === undefined ? url : `${gatewayBase}${ipfsPath}`;
+  try {
+    const resolved = new URL(`${gatewayBase}${ipfsPath}`);
+    return resolved.href.startsWith(gatewayBase) ? resolved.href : url;
+  } catch {
+    return url;
+  }
 }

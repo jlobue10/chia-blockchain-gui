@@ -543,6 +543,40 @@ describe('CacheManager eviction', () => {
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
   });
 
+  it('starts the transient retry count over on a gateway change', async () => {
+    const url = 'ipfs://QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    mockDownloadFile.mockRejectedValue(new Error('HTTP error: 503'));
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    try {
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      now += transientErrorRetryDelay(1);
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      expect(await cacheManager.getCacheInfos([url])).toEqual([
+        expect.objectContaining({ retries: 2, gateway: 'https://ipfs.io/ipfs/' }),
+      ]);
+
+      // the failures were a verdict on the old gateway; the new one has not
+      // failed yet
+      mockIpfsGatewayBase.mockReturnValue('https://dweb.link/ipfs/');
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(3);
+      expect(await cacheManager.getCacheInfos([url])).toEqual([
+        expect.objectContaining({ retries: 1, gateway: 'https://dweb.link/ipfs/' }),
+      ]);
+    } finally {
+      nowSpy.mockRestore();
+      mockIpfsGatewayBase.mockReturnValue('https://ipfs.io/ipfs/');
+    }
+  });
+
   it('does not treat a gateway change as a reason to retry while the gateway option is off', async () => {
     const url = 'ipfs://QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
     mockDownloadFile.mockRejectedValue(new Error('HTTP error: 403'));

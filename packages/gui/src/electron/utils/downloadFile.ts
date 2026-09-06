@@ -14,7 +14,7 @@ import {
 
 import fileExists from './fileExists';
 import { toFetchableUrl } from './ipfsGateway';
-import isValidURL from './isValidURL';
+import isValidURL, { isValidRequestURL } from './isValidURL';
 
 const log = debug('chia-gui:downloadFile');
 
@@ -115,13 +115,19 @@ export default async function downloadFile(
     throw new Error('Request aborted');
   }
 
-  const tempFilePath = `${localPath}.tmp`;
   // ipfs:// URIs are fetched through an HTTPS gateway when the user has
   // enabled it — Electron's net stack cannot request the ipfs scheme, and
   // with the option off toFetchableUrl refuses the fetch outright. Only
   // this outgoing request uses the translated URL; callers keep the original
-  // URI as the cache key.
-  const request = net.request(toFetchableUrl(url, gatewayBase));
+  // URI as the cache key. The translated URL is what actually leaves the
+  // machine, so it is the string that gets validated.
+  const requestUrl = toFetchableUrl(url, gatewayBase);
+  if (!isValidRequestURL(requestUrl)) {
+    throw new Error('Invalid URL');
+  }
+
+  const tempFilePath = `${localPath}.tmp`;
+  const request = net.request(requestUrl);
   const outputStream = new WriteStreamPromise(tempFilePath, overrideFile);
 
   // set when we abort the request ourselves, so abort events can be reported

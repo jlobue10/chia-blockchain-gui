@@ -611,7 +611,7 @@ export default class CacheManager extends EventEmitter {
         return await this.setCacheInfo(url, {
           state: CacheState.ERROR,
           error: currentError.message,
-          ...(isTransient ? { retries: this.consecutiveTransientFailures(previousCacheInfo) + 1 } : {}),
+          ...(isTransient ? { retries: this.consecutiveTransientFailures(previousCacheInfo, requestGateway) + 1 } : {}),
           // which gateway the verdict belongs to (see isGatewayChanged above)
           ...(requestGateway === undefined ? {} : { gateway: requestGateway }),
         });
@@ -632,10 +632,16 @@ export default class CacheManager extends EventEmitter {
   }
 
   // How many transient failures in a row the persisted outcome already
-  // records — zero when there is none, or when the last outcome was anything
-  // other than a transient failure (a success, a settled error, an abort).
-  private consecutiveTransientFailures(previous: CacheInfo | undefined): number {
-    if (previous?.state !== CacheState.ERROR || !isTransientDownloadError(previous.error)) {
+  // records — zero when there is none, when the last outcome was anything
+  // other than a transient failure (a success, a settled error, an abort), or
+  // when it went through a different gateway: a failure is a verdict on one
+  // gateway, so a new gateway starts with a clean slate.
+  private consecutiveTransientFailures(previous: CacheInfo | undefined, gateway: string | undefined): number {
+    if (
+      previous?.state !== CacheState.ERROR ||
+      !isTransientDownloadError(previous.error) ||
+      previous.gateway !== gateway
+    ) {
       return 0;
     }
 
