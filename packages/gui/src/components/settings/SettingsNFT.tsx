@@ -171,7 +171,8 @@ export default function SettingsGeneral() {
             <Trans>
               NFT files published with ipfs:// addresses will be downloaded through an HTTPS gateway. The requested URL
               differs from the address recorded on chain, but downloaded content is still verified against the NFT's
-              on-chain hash. When disabled, ipfs:// files are not fetched.
+              on-chain hash. The gateway operator can see your IP address and which NFT files you view. When disabled,
+              ipfs:// files are not fetched.
             </Trans>
           </SettingsText>
         </Grid>
