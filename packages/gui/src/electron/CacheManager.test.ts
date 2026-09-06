@@ -1412,6 +1412,78 @@ describe('CacheManager request options from the renderer', () => {
   });
 });
 
+describe('CacheManager sidecar integrity and error redaction', () => {
+  let cacheDirectory: string;
+
+  beforeEach(async () => {
+    mockDownloadFile.mockReset();
+    cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'chia-cache-sidecar-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(cacheDirectory, { recursive: true, force: true });
+  });
+
+  it('writes a sidecar through a temp file that is gone once the entry is published', async () => {
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, 'bytes');
+      return { 'content-type': 'image/png' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    await cacheManager.getContent('https://example.com/nft.png');
+    const files = await fs.readdir(cacheDirectory);
+    expect(files).toHaveLength(2);
+    expect(files.some((file) => file.endsWith('.tmp'))).toBe(false);
+  });
+
+  it('treats a sidecar that is not JSON as no entry, removes it, and fetches afresh', async () => {
+    const payload = Buffer.from('fresh bytes');
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'image/png' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/nft.png';
+    await cacheManager.getContent(url);
+    const infoFile = (await fs.readdir(cacheDirectory)).find((file) => file.endsWith('-info'))!;
+    // what a crash mid-write left behind before sidecars were renamed into place
+    await fs.writeFile(path.join(cacheDirectory, infoFile), '{"url":"https://example.com/nft.png","state":"CA');
+
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info.state).toBe('NOT_CACHED');
+    await expect(fs.stat(path.join(cacheDirectory, infoFile))).rejects.toThrow();
+
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+    const [after] = await cacheManager.getCacheInfos([url]);
+    expect(after.state).toBe('CACHED');
+  });
+
+  it('keeps the cache directory out of a persisted download error and out of what the renderer reads', async () => {
+    mockDownloadFile.mockRejectedValue(
+      Object.assign(new Error(`EACCES: permission denied, open '${cacheDirectory}/abc-chiacache.tmp'`), {
+        code: 'EACCES',
+      }),
+    );
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/nft.png';
+    await expect(cacheManager.getContent(url)).rejects.toThrow('EACCES: cache file operation failed');
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info.state).toBe('ERROR');
+    expect(info.error).toBe('EACCES: cache file operation failed');
+    expect(info.error).not.toContain(cacheDirectory);
+  });
+
+  it('leaves an error that names no cache path as it is', () => {
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    const error = new Error('HTTP error: 404');
+    expect(cacheManager.redactCachePath(error)).toBe(error);
+  });
+});
+
 describe('CacheManager cache: responses', () => {
   let cacheDirectory: string;
 
