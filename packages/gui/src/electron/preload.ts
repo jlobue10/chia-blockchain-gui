@@ -133,8 +133,7 @@ contextBridge.exposeInMainWorld(API.CACHE, {
     invokeWithCustomErrors(CacheAPI.GET_HEADERS, url, options),
   getChecksum: (url: string, options?: CacheRequestOptions) =>
     invokeWithCustomErrors(CacheAPI.GET_CHECKSUM, url, options),
-  getURI: (url: string, options?: CacheRequestOptions) =>
-    invokeWithCustomErrors(CacheAPI.GET_URI, url, options),
+  getURI: (url: string, options?: CacheRequestOptions) => invokeWithCustomErrors(CacheAPI.GET_URI, url, options),
   invalidate: (url: string) => invokeWithCustomErrors(CacheAPI.INVALIDATE, url),
   getCacheInfos: (urls: string[]) => invokeWithCustomErrors(CacheAPI.GET_CACHE_INFOS, urls),
   subscribeToDirectoryChange: (callback: (...args: unknown[]) => void) =>

@@ -22,11 +22,16 @@ export default class DownloadDeadline {
 
   private startedAt: number | undefined;
 
+  private finishedAt: number | undefined;
+
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   public error: Error | undefined;
 
-  constructor(duration: number | undefined, private readonly abort: () => void) {
+  constructor(
+    duration: number | undefined,
+    private readonly abort: () => void,
+  ) {
     this.duration = normalizeDownloadDuration(duration);
   }
 
@@ -63,6 +68,15 @@ export default class DownloadDeadline {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+  }
+
+  finish() {
+    this.finishedAt = Date.now();
+    this.dispose();
+  }
+
+  elapsed(): number {
+    return this.startedAt === undefined ? 0 : Math.max(0, (this.finishedAt ?? Date.now()) - this.startedAt);
   }
 
   private expire() {

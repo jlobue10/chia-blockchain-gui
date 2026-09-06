@@ -5,11 +5,7 @@ export const CHECKSUM_MISMATCH_ERROR = 'Checksum mismatch';
 export const MAX_METADATA_URI_ATTEMPTS = 5;
 export const METADATA_URI_BUDGET_MS = 60_000;
 
-export type FetchMetadata = (
-  uri: string,
-  hash: string | undefined,
-  options: CacheRequestOptions,
-) => Promise<Metadata>;
+export type FetchMetadata = (uri: string, hash: string | undefined, options: CacheRequestOptions) => Promise<Metadata>;
 
 /** Ordered, hash-checked copies of an NFT's metadata, with bounded work.
  * Reserve an equal share of the 60-second TRANSFER allowance for each of

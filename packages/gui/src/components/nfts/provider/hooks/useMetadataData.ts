@@ -9,6 +9,7 @@ import type MetadataOnDemand from '../../../../@types/MetadataOnDemand';
 import type MetadataState from '../../../../@types/MetadataState';
 import useFetchAndProcessMetadata from '../../../../hooks/useFetchAndProcessMetadata';
 import useIpfsGateway from '../../../../hooks/useIpfsGateway';
+import { useIpfsGatewayBase } from '../../../../hooks/useIpfsGatewayUrl';
 import fetchMetadataFromUris from '../../../../util/fetchMetadataFromUris';
 import getNFTId from '../../../../util/getNFTId';
 
@@ -162,16 +163,19 @@ export default function useMetadataData(props: UseMetadataDataProps) {
   );
 
   const [ipfsGateway] = useIpfsGateway();
-  const lastIpfsGatewayRef = useRef(ipfsGateway);
+  const ipfsGatewayBase = useIpfsGatewayBase();
+  // one key for both gateway preferences: the option and the gateway itself
+  const ipfsGatewayKey = ipfsGateway ? ipfsGatewayBase : false;
+  const lastIpfsGatewayRef = useRef(ipfsGatewayKey);
 
   useEffect(() => {
-    if (lastIpfsGatewayRef.current === ipfsGateway) {
+    if (lastIpfsGatewayRef.current === ipfsGatewayKey) {
       return;
     }
-    lastIpfsGatewayRef.current = ipfsGateway;
+    lastIpfsGatewayRef.current = ipfsGatewayKey;
 
-    // Flipping the gateway option changes which URIs the main process will
-    // fetch, so cached failures are stale — without this, a failed ipfs
+    // Flipping the gateway option or switching gateways changes which URLs
+    // the main process will fetch, so cached failures are stale — without this, a failed ipfs
     // metadata fetch stayed cached here and its NFT kept looking broken
     // after enabling the option, until a full app reload. Only failures are
     // retried: successfully fetched metadata is hash-verified content and
@@ -205,7 +209,7 @@ export default function useMetadataData(props: UseMetadataDataProps) {
         });
       }
     });
-  }, [ipfsGateway, invalidate /* immutable */, metadatasOnDemand /* immutable */]);
+  }, [ipfsGatewayKey, invalidate /* immutable */, metadatasOnDemand /* immutable */]);
 
   // immutable function
   const subscribeToMetadataChanges = useCallback(
