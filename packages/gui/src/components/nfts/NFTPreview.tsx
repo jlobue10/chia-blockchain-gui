@@ -231,6 +231,16 @@ export default function NFTPreview(props: NFTPreviewProps) {
           return;
         }
 
+        // An extensionless uri (a bare ipfs CID, say) has no type until its
+        // headers arrive. Preparing it before then would render it as an image
+        // — a broken one for a video — and that content would still be on
+        // screen, and counted as an available preview, while the run for the
+        // settled type is probing the file below.
+        if (isLoadingFileType) {
+          setPreviewContent(undefined, signal);
+          return;
+        }
+
         const style = `
           html, body {
             border: 0px;
@@ -267,8 +277,11 @@ export default function NFTPreview(props: NFTPreviewProps) {
         // The player runs in a scriptless sandbox and cannot say when Chromium
         // rejects the stream, so ask the media pipeline first. Only a definite
         // verdict counts — a probe that fails for any other reason falls
-        // through to the player as before.
+        // through to the player as before. Whatever an earlier run of this
+        // callback left on screen comes down first: nothing is a preview, and
+        // nothing reports as one, until the probe has passed.
         if (previewFileType === FileType.VIDEO || previewFileType === FileType.AUDIO) {
+          setPreviewContent(undefined, signal);
           const playability = await probeMediaPlayability(
             cachedURI,
             previewFileType === FileType.VIDEO ? 'video' : 'audio',
@@ -332,6 +345,7 @@ export default function NFTPreview(props: NFTPreviewProps) {
       getURI,
       ignoreSizeLimit,
       previewFileType,
+      isLoadingFileType,
       loopVideo,
       isDarkMode,
       setPreviewContent,
