@@ -7,6 +7,7 @@ type DownloadFile = typeof import('./utils/downloadFile').default;
 const mockDownloadFile = jest.fn<ReturnType<DownloadFile>, Parameters<DownloadFile>>();
 jest.mock('electron', () => ({ BrowserWindow: jest.fn(), dialog: { showOpenDialog: jest.fn() } }));
 jest.mock('./utils/downloadFile', () => ({
+  __esModule: true,
   ...jest.requireActual('./utils/downloadFile'),
   default: mockDownloadFile,
 }));
@@ -49,7 +50,9 @@ describe('CacheManager directory migration', () => {
       .mockImplementationOnce(async (_url, file, options) => {
         await fs.writeFile(`${file}.tmp`, 'partial');
         started.resolve();
-        await new Promise<void>((resolve) => options?.signal?.addEventListener('abort', () => resolve(), { once: true }));
+        await new Promise<void>((resolve) =>
+          options?.signal?.addEventListener('abort', () => resolve(), { once: true }),
+        );
         aborted.resolve();
         await finish.promise;
         await fs.unlink(`${file}.tmp`);
@@ -144,5 +147,100 @@ describe('CacheManager directory migration', () => {
     expect(await fs.readFile(path.join(newDirectory, files[1]), 'utf-8')).toBe('existing');
     expect(await fs.readdir(newDirectory)).toHaveLength(1);
     expect(await fs.readdir(oldDirectory)).toHaveLength(2);
+  });
+
+  it('looks a cached entry up again when a clear begins between its lookup and its read', async () => {
+    mockDownloadFile.mockImplementation(async (_url, file) => {
+      await fs.writeFile(file, 'complete');
+      return {};
+    });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    await cache.getContent('https://example.com/five');
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+
+    // the read finds the entry cached, then a clear starts before it opens the
+    // file — the read must not fail on a file the clear removed
+    const read = cache.getContent('https://example.com/five');
+    const clear = cache.clearCache();
+    await clear;
+    expect((await read).toString()).toBe('complete');
+    // fetched afresh into the cleared cache rather than read from nowhere
+    expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+    expect(await fs.readdir(oldDirectory)).toHaveLength(2);
+  });
+
+  it('applies an invalidation issued during a migration to the destination, after the copy pass', async () => {
+    mockDownloadFile.mockImplementation(async (_url, file) => {
+      await fs.writeFile(file, 'complete');
+      return {};
+    });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    await cache.getContent('https://example.com/six');
+
+    // hold the copy pass open on its first file so an invalidation can arrive mid-migration
+    const copyStarted = deferred();
+    const releaseCopy = deferred();
+    const realCopyFile = fs.copyFile.bind(fs);
+    const copySpy = jest.spyOn(fs, 'copyFile').mockImplementation(async (...args) => {
+      copyStarted.resolve();
+      await releaseCopy.promise;
+      return realCopyFile(...(args as Parameters<typeof fs.copyFile>));
+    });
+    try {
+      const migration = cache.setCacheDirectory();
+      await copyStarted.promise;
+      const invalidation = cache.invalidate('https://example.com/six');
+      // the invalidation is held back while the copy pass runs: the old
+      // directory still has both files, so the copy cannot fail on them
+      await Promise.resolve();
+      expect(await fs.readdir(oldDirectory)).toHaveLength(2);
+      releaseCopy.resolve();
+      await migration;
+      await invalidation;
+    } finally {
+      copySpy.mockRestore();
+    }
+
+    expect(cache.cacheDirectory).toBe(newDirectory);
+    // the entry was removed from the directory that is current once the migration finished
+    expect(await fs.readdir(newDirectory)).toEqual([]);
+    expect(await fs.readdir(oldDirectory)).toEqual([]);
+  });
+
+  it('carries on when a source file vanishes during the copy pass, and does not carry its orphaned data', async () => {
+    mockDownloadFile.mockImplementation(async (_url, file) => {
+      await fs.writeFile(file, 'complete');
+      return {};
+    });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    await cache.getContent('https://example.com/seven');
+    await cache.getContent('https://example.com/eight');
+    const [dataOfOne] = (await fs.readdir(oldDirectory)).filter((file) => !file.endsWith('-info'));
+
+    // the sidecar of one entry disappears from outside once its data file has
+    // been copied — the way a stray deletion or a crash mid-invalidation would
+    const realCopyFile = fs.copyFile.bind(fs);
+    const copySpy = jest.spyOn(fs, 'copyFile').mockImplementation(async (...args) => {
+      const [source] = args as Parameters<typeof fs.copyFile>;
+      if (String(source).endsWith(dataOfOne)) {
+        await fs.unlink(`${source}-info`);
+      }
+      return realCopyFile(...(args as Parameters<typeof fs.copyFile>));
+    });
+    try {
+      await expect(cache.setCacheDirectory()).resolves.toBeUndefined();
+    } finally {
+      copySpy.mockRestore();
+    }
+
+    expect(cache.cacheDirectory).toBe(newDirectory);
+    // the intact entry moved; the one that lost its sidecar was not carried over as an unservable orphan
+    const migrated = await fs.readdir(newDirectory);
+    expect(migrated).toHaveLength(2);
+    expect(migrated.some((file) => file === dataOfOne)).toBe(false);
+    expect((await cache.getContent('https://example.com/eight')).toString()).toBe('complete');
   });
 });

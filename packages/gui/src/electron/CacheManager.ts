@@ -683,15 +683,30 @@ export default class CacheManager extends EventEmitter {
     }
 
     if (cacheInfo.state === CacheState.CACHED) {
-      while (this.maintenance) {
-        // eslint-disable-next-line no-await-in-loop -- Read from the completed destination.
-        await this.maintenance.catch(() => {});
+      if (this.maintenance) {
+        // A clear or migration began after the lookup settled, so what it
+        // found is stale: the file may be gone, or live in another directory
+        // by the time it is read. Look again once the maintenance is done —
+        // a cleared entry is fetched afresh rather than read from nowhere.
+        await this.waitForMaintenance();
+        return this.getContent(url, options);
       }
+
       const filePath = this.getCacheFilePath(url);
       return fs.readFile(filePath);
     }
 
     throw new Error('Unknown cache state');
+  }
+
+  // Waits out every maintenance operation (clear, migration) in progress or
+  // queued. A failed operation is its caller's to report; here it only ends
+  // the wait.
+  private async waitForMaintenance() {
+    while (this.maintenance) {
+      // eslint-disable-next-line no-await-in-loop -- another operation may have been queued while this one ran
+      await this.maintenance.catch(() => {});
+    }
   }
 
   async getChecksum(
@@ -789,12 +804,14 @@ export default class CacheManager extends EventEmitter {
   // reported to its caller but must not poison subsequent maintenance/fetches.
   private runMaintenance(operation: () => Promise<void>): Promise<void> {
     const previous = this.maintenance ?? Promise.resolve();
-    const pending = previous.catch(() => {}).then(async () => {
-      const ongoing = Array.from(this.ongoingRequests.values());
-      ongoing.forEach((request) => request.abort());
-      await Promise.allSettled(ongoing.map((request) => request.promise));
-      await operation();
-    });
+    const pending = previous
+      .catch(() => {})
+      .then(async () => {
+        const ongoing = Array.from(this.ongoingRequests.values());
+        ongoing.forEach((request) => request.abort());
+        await Promise.allSettled(ongoing.map((request) => request.promise));
+        await operation();
+      });
     this.maintenance = pending;
     return pending.finally(() => {
       if (this.maintenance === pending) {
@@ -845,7 +862,7 @@ export default class CacheManager extends EventEmitter {
       // sidecar writes. No live temp can be left here and no replacement can
       // start until this operation releases the barrier.
       const files = await fs.readdir(oldDirectory);
-      const moved: { source: string; destination: string }[] = [];
+      const moved: { file: string; source: string; destination: string }[] = [];
       try {
         for (const file of files) {
           if (!isChiaCacheFile(file)) {
@@ -858,17 +875,36 @@ export default class CacheManager extends EventEmitter {
             await safeUnlink(source);
             continue;
           }
-          // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
-          const stat = await fs.lstat(source);
-          if (stat.isFile()) {
-            // Do not overwrite a pre-existing cache in the destination. Copy
-            // first also permits cross-volume migration; remove the source
-            // only after the entire copy pass has succeeded.
+          try {
             // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
-            await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
-            moved.push({ source, destination });
+            const stat = await fs.lstat(source);
+            if (stat.isFile()) {
+              // Do not overwrite a pre-existing cache in the destination. Copy
+              // first also permits cross-volume migration; remove the source
+              // only after the entire copy pass has succeeded.
+              // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
+              await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+              moved.push({ file, source, destination });
+            }
+          } catch (error) {
+            // A source that vanished since the listing — deleted from outside,
+            // or by an invalidation that beat the barrier — has nothing to
+            // migrate; it must not fail the whole move.
+            if ((error as { code?: string }).code !== 'ENOENT') {
+              throw error;
+            }
           }
         }
+
+        // A data file whose sidecar did not make it across cannot be served
+        // (the cache never trusts bytes without their sidecar), so it is not
+        // carried over either; sidecars stand on their own, as ERROR entries do.
+        const movedFiles = new Set(moved.map(({ file }) => file));
+        const orphans = moved.filter(
+          ({ file }) => !isChiaCacheInfoFile(file) && !movedFiles.has(getInfoFilePath(file)),
+        );
+        await Promise.all(orphans.map(({ destination }) => safeUnlink(destination)));
+        orphans.forEach((orphan) => moved.splice(moved.indexOf(orphan), 1));
       } catch (error) {
         await Promise.all(moved.map(({ destination }) => safeUnlink(destination)));
         throw error;
@@ -876,13 +912,15 @@ export default class CacheManager extends EventEmitter {
 
       // Publish only a complete destination. Failure to unlink an old copy is
       // logged rather than turning a successful copy into a split live entry.
-      await Promise.all(moved.map(async ({ source }) => {
-        try {
-          await fs.unlink(source);
-        } catch (error) {
-          log(`Could not remove migrated cache copy: ${(error as Error).message}`);
-        }
-      }));
+      await Promise.all(
+        moved.map(async ({ source }) => {
+          try {
+            await fs.unlink(source);
+          } catch (error) {
+            log(`Could not remove migrated cache copy: ${(error as Error).message}`);
+          }
+        }),
+      );
       this.cacheDirectory = newDirectory;
       this.emit('sizeChanged');
     });
@@ -962,6 +1000,12 @@ export default class CacheManager extends EventEmitter {
       ongoingRequest.abort();
     }
 
+    // A migration copies the directory file by file and a clear empties it;
+    // deleting from under either would fail the copy pass, or remove from a
+    // directory that is about to stop being the cache. Apply the deletion to
+    // whatever directory is current once maintenance is done.
+    await this.waitForMaintenance();
+
     // prepare invalidation
     const filePath = this.getCacheFilePath(url);
 
@@ -975,6 +1019,8 @@ export default class CacheManager extends EventEmitter {
   async setMaxCacheSize(maxCacheSize: number | string) {
     this.maxCacheSize = maxCacheSize;
     if (this.maxCacheSize > 0) {
+      // eviction deletes files too — see invalidate
+      await this.waitForMaintenance();
       await this.removeOldestFiles(this.maxCacheSize);
     }
   }
