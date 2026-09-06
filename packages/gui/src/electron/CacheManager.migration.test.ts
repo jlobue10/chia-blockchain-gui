@@ -241,6 +241,8 @@ describe('CacheManager directory migration', () => {
     const migrated = await fs.readdir(newDirectory);
     expect(migrated).toHaveLength(2);
     expect(migrated.some((file) => file === dataOfOne)).toBe(false);
+    // ... and its payload did not stay behind either: nothing reclaims the old directory once the destination is published
+    expect(await fs.readdir(oldDirectory)).toEqual([]);
     expect((await cache.getContent('https://example.com/eight')).toString()).toBe('complete');
   });
 });

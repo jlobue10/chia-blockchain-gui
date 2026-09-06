@@ -862,7 +862,11 @@ export default class CacheManager extends EventEmitter {
       // sidecar writes. No live temp can be left here and no replacement can
       // start until this operation releases the barrier.
       const files = await fs.readdir(oldDirectory);
-      const moved: { file: string; source: string; destination: string }[] = [];
+      const moved: { file: string; destination: string }[] = [];
+      // Every source that was copied, orphans included: the old directory is
+      // never looked at again once the destination is published, so anything
+      // left there is never counted, evicted or cleared.
+      const copiedSources: string[] = [];
       try {
         for (const file of files.filter((name) => isChiaCacheFile(name))) {
           const source = path.join(oldDirectory, file);
@@ -881,7 +885,8 @@ export default class CacheManager extends EventEmitter {
                 // only after the entire copy pass has succeeded.
                 // eslint-disable-next-line no-await-in-loop -- Keep migration ordered.
                 await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
-                moved.push({ file, source, destination });
+                moved.push({ file, destination });
+                copiedSources.push(source);
               }
             } catch (error) {
               // A source that vanished since the listing — deleted from outside,
@@ -911,7 +916,7 @@ export default class CacheManager extends EventEmitter {
       // Publish only a complete destination. Failure to unlink an old copy is
       // logged rather than turning a successful copy into a split live entry.
       await Promise.all(
-        moved.map(async ({ source }) => {
+        copiedSources.map(async (source) => {
           try {
             await fs.unlink(source);
           } catch (error) {
