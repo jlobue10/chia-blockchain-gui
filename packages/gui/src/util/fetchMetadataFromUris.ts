@@ -4,6 +4,11 @@ import type Metadata from '../@types/Metadata';
 export const CHECKSUM_MISMATCH_ERROR = 'Checksum mismatch';
 export const MAX_METADATA_URI_ATTEMPTS = 5;
 export const METADATA_URI_BUDGET_MS = 60_000;
+// A metadata file is a JSON document a few kilobytes long; the confirmation
+// dialog's own metadata fetch allows 5 MiB, and the gallery's fetch allows the
+// same. The download cap for video would let a minter hand the renderer
+// 100 MB to parse on the UI thread.
+export const METADATA_MAX_SIZE = 5 * 1024 * 1024;
 
 export type FetchMetadata = (uri: string, hash: string | undefined, options: CacheRequestOptions) => Promise<Metadata>;
 

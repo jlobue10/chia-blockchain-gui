@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -15,8 +16,16 @@ jest.mock('../prefs', () => ({
   readPrefs: mockReadPrefs,
 }));
 
-const { default: downloadFile, isTransientDownloadError } =
-  jest.requireActual<typeof import('./downloadFile')>('./downloadFile');
+const {
+  default: downloadFile,
+  isTransientDownloadError,
+  normalizeMaxSize,
+  normalizeTimeout,
+  DEFAULT_MAX_FILE_SIZE,
+  MAX_FILE_SIZE_CEILING,
+  DEFAULT_INACTIVITY_TIMEOUT,
+  DEFAULT_DOWNLOAD_MAX_DURATION,
+} = jest.requireActual<typeof import('./downloadFile')>('./downloadFile');
 const { NFT_IPFS_GATEWAY_PREF } = jest.requireActual<typeof import('./ipfsGateway')>('./ipfsGateway');
 
 const CID = 'QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB';
@@ -52,7 +61,10 @@ describe('downloadFile', () => {
       }),
     ).rejects.toThrow('HTTP error: 404');
 
-    expect(mockNetRequest).toHaveBeenCalledWith(`http://127.0.0.1:8080/ipfs/${CID}/img.png`);
+    expect(mockNetRequest).toHaveBeenCalledWith({
+      url: `http://127.0.0.1:8080/ipfs/${CID}/img.png`,
+      redirect: 'manual',
+    });
   });
 
   // The URL that leaves the machine is the gateway form, not the ipfs URI the
@@ -97,7 +109,10 @@ describe('downloadFile', () => {
       ),
     ).rejects.toThrow('HTTP error: 404');
 
-    expect(mockNetRequest).toHaveBeenCalledWith('https://gateway.pinata.cloud/ipfs/bafybeigdyrztest/img.png');
+    expect(mockNetRequest).toHaveBeenCalledWith({
+      url: 'https://gateway.pinata.cloud/ipfs/bafybeigdyrztest/img.png',
+      redirect: 'manual',
+    });
     expect(request.setHeader).toHaveBeenCalledWith('User-Agent', expect.stringMatching(/^Chia-Blockchain-GUI\//));
   });
 
@@ -121,7 +136,10 @@ describe('downloadFile', () => {
       ),
     ).rejects.toThrow('HTTP error: 404');
 
-    expect(mockNetRequest).toHaveBeenCalledWith('http://127.0.0.1:8080/ipfs/bafybeigdyrztest/img.png');
+    expect(mockNetRequest).toHaveBeenCalledWith({
+      url: 'http://127.0.0.1:8080/ipfs/bafybeigdyrztest/img.png',
+      redirect: 'manual',
+    });
   });
 
   it('rejects an invalid override URL before requesting anything', async () => {
@@ -145,6 +163,64 @@ describe('downloadFile', () => {
     ).rejects.toThrow('Request aborted');
 
     expect(mockNetRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe('downloadFile redirects', () => {
+  type MockRequest = EventEmitter & { end: jest.Mock; abort: jest.Mock; followRedirect: jest.Mock };
+  let request: MockRequest;
+
+  function makeResponse(statusCode = 200, headers: Record<string, string> = { 'content-type': 'image/png' }) {
+    return Object.assign(new EventEmitter(), { statusCode, headers });
+  }
+
+  beforeEach(() => {
+    request = Object.assign(new EventEmitter(), {
+      end: jest.fn(),
+      abort: jest.fn(),
+      followRedirect: jest.fn(),
+      setHeader: jest.fn(),
+    });
+    request.abort.mockImplementation(() => {
+      request.emit('abort');
+    });
+    mockNetRequest.mockReturnValue(request);
+  });
+
+  it('asks for manual redirects and follows one that stays on https', async () => {
+    const localPath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'downloadFile-redirect-')), 'nft.png');
+    const download = downloadFile('https://minter.example/a.png', localPath);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(mockNetRequest).toHaveBeenCalledWith({ url: 'https://minter.example/a.png', redirect: 'manual' });
+
+    request.emit('redirect', 302, 'GET', 'https://cdn.example/a.png', {});
+    expect(request.followRedirect).toHaveBeenCalledTimes(1);
+
+    const response = makeResponse();
+    request.emit('response', response);
+    response.emit('data', Buffer.from('png bytes'));
+    response.emit('end');
+
+    await expect(download).resolves.toEqual({ 'content-type': 'image/png' });
+    expect((await fs.readFile(localPath)).toString()).toBe('png bytes');
+  });
+
+  it('refuses a redirect to a plain-http loopback address and settles permanently', async () => {
+    const localPath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'downloadFile-redirect-')), 'nft.png');
+    const download = downloadFile('https://minter.example/a.png', localPath);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+    request.emit('redirect', 302, 'GET', 'http://127.0.0.1:8080/api/v0/shutdown', {});
+    expect(request.followRedirect).not.toHaveBeenCalled();
+    expect(request.abort).toHaveBeenCalled();
+
+    await expect(download).rejects.toThrow('Redirect refused');
+    expect(isTransientDownloadError('Redirect refused')).toBe(false);
+    await expect(fs.stat(`${localPath}.tmp`)).rejects.toThrow();
   });
 });
 
@@ -210,5 +286,40 @@ describe('isTransientDownloadError', () => {
     'net::ERR_TOO_MANY_REDIRECTS',
   ])('treats the network error %p as permanent', (message) => {
     expect(isTransientDownloadError(message)).toBe(false);
+  });
+});
+
+describe('normalizeMaxSize', () => {
+  it.each([
+    [undefined, DEFAULT_MAX_FILE_SIZE],
+    [Number.NaN, DEFAULT_MAX_FILE_SIZE],
+    ['10' as unknown as number, DEFAULT_MAX_FILE_SIZE],
+    [{} as unknown as number, DEFAULT_MAX_FILE_SIZE],
+    // "no limit" is the ceiling, never unbounded
+    [-1, MAX_FILE_SIZE_CEILING],
+    [0, MAX_FILE_SIZE_CEILING],
+    [Number.POSITIVE_INFINITY, MAX_FILE_SIZE_CEILING],
+    [MAX_FILE_SIZE_CEILING * 4, MAX_FILE_SIZE_CEILING],
+    [5 * 1024 * 1024, 5 * 1024 * 1024],
+    [1234.9, 1234],
+  ])('turns %p into %p', (value, expected) => {
+    expect(normalizeMaxSize(value)).toBe(expected);
+  });
+});
+
+describe('normalizeTimeout', () => {
+  it.each([
+    [undefined, DEFAULT_INACTIVITY_TIMEOUT],
+    [Number.NaN, DEFAULT_INACTIVITY_TIMEOUT],
+    [0, DEFAULT_INACTIVITY_TIMEOUT],
+    [-5, DEFAULT_INACTIVITY_TIMEOUT],
+    ['10' as unknown as number, DEFAULT_INACTIVITY_TIMEOUT],
+    [Number.POSITIVE_INFINITY, DEFAULT_INACTIVITY_TIMEOUT],
+    // beyond what a timer can represent: clamped, never overflowing to ~1 ms
+    [1e12, DEFAULT_DOWNLOAD_MAX_DURATION],
+    [10_000, 10_000],
+    [0.5, 1],
+  ])('turns %p into %p', (value, expected) => {
+    expect(normalizeTimeout(value)).toBe(expected);
   });
 });

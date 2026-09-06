@@ -20,6 +20,8 @@ jest.mock('./utils/downloadFile', () => ({
   MAX_FILE_SIZE_EXCEEDED_ERROR: 'Maximum file size exceeded',
   DEFAULT_DOWNLOAD_MAX_DURATION: jest.requireActual('./utils/downloadFile').DEFAULT_DOWNLOAD_MAX_DURATION,
   isTransientDownloadError: jest.requireActual('./utils/downloadFile').isTransientDownloadError,
+  normalizeMaxSize: jest.requireActual('./utils/downloadFile').normalizeMaxSize,
+  normalizeTimeout: jest.requireActual('./utils/downloadFile').normalizeTimeout,
 }));
 
 const { DEFAULT_DOWNLOAD_MAX_DURATION } =
@@ -46,6 +48,7 @@ const {
   MAX_TRANSIENT_ERROR_RETRY_DELAY,
   MAX_TRANSIENT_RETRIES,
   transientErrorRetryDelay,
+  servedContentType,
 } = jest.requireActual<typeof import('./CacheManager')>('./CacheManager');
 
 // The download starts only after the sidecar has been read, so a test that
@@ -1144,5 +1147,99 @@ describe('CacheManager getCacheInfos', () => {
     const infos = await cacheManager.getCacheInfos(urls.slice(0, MAX_CACHE_INFO_LOOKUPS));
     expect(infos).toHaveLength(MAX_CACHE_INFO_LOOKUPS);
     expect(infos.every((info) => info.state === 'NOT_CACHED')).toBe(true);
+  });
+});
+
+describe('CacheManager request options from the renderer', () => {
+  let cacheDirectory: string;
+
+  beforeEach(async () => {
+    mockDownloadFile.mockReset();
+    cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'chia-cache-options-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(cacheDirectory, { recursive: true, force: true });
+  });
+
+  it.each([
+    // a request for "no limit" gets the ceiling, not an unbounded transfer
+    [{ maxSize: -1 }, { maxSize: 2 * 1024 * 1024 * 1024, timeout: 30_000 }],
+    [{ maxSize: 0 }, { maxSize: 2 * 1024 * 1024 * 1024, timeout: 30_000 }],
+    [{ maxSize: Number.NaN }, { maxSize: 100 * 1024 * 1024, timeout: 30_000 }],
+    [{ maxSize: 'huge' as unknown as number }, { maxSize: 100 * 1024 * 1024, timeout: 30_000 }],
+    // a timeout a timer cannot hold is clamped to the transfer ceiling
+    [{ timeout: 1e12 }, { maxSize: 100 * 1024 * 1024, timeout: 30 * 60 * 1000 }],
+    [{ timeout: 0 }, { maxSize: 100 * 1024 * 1024, timeout: 30_000 }],
+    [
+      { maxSize: 5 * 1024 * 1024, timeout: 10_000 },
+      { maxSize: 5 * 1024 * 1024, timeout: 10_000 },
+    ],
+  ])('hands the download %p as %p', async (options, expected) => {
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, 'bytes');
+      return { 'content-type': 'image/png' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    await cacheManager.getContent('https://example.com/nft.png', options);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+    expect(mockDownloadFile.mock.calls[0][2]).toMatchObject(expected);
+  });
+});
+
+describe('CacheManager cache: responses', () => {
+  let cacheDirectory: string;
+
+  beforeEach(async () => {
+    mockDownloadFile.mockReset();
+    cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'chia-cache-protocol-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(cacheDirectory, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['image/png', 'image/png'],
+    ['video/mp4; charset=binary', 'video/mp4; charset=binary'],
+    ['audio/ogg', 'audio/ogg'],
+    ['model/gltf-binary', 'model/gltf-binary'],
+    ['text/html', 'application/octet-stream'],
+    ['text/html; charset=utf-8', 'application/octet-stream'],
+    ['application/javascript', 'application/octet-stream'],
+    ['image/svg+xml; foo=bar', 'application/octet-stream'],
+    ['', 'application/octet-stream'],
+    [undefined, 'application/octet-stream'],
+  ])('serves a stored type of %p as %p', (stored, served) => {
+    expect(servedContentType(stored)).toBe(served);
+  });
+
+  it('serves cached bytes as an opaque, sandboxed, unsniffable response when the remote type is not media', async () => {
+    const payload = Buffer.from('<script>alert(1)</script>');
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'text/html' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/nft';
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    // what the tile is handed and what the protocol serves are the same file
+    const cacheUrl = await cacheManager.getURI(url);
+    expect(cacheUrl.startsWith('cache://')).toBe(true);
+
+    let handler: ((request: Request) => Promise<Response>) | undefined;
+    cacheManager.prepareProtocol({
+      handle: (_scheme: string, callback: (request: Request) => Promise<Response>) => {
+        handler = callback;
+      },
+    } as never);
+    const response = await handler!(new Request(cacheUrl));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('application/octet-stream');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox");
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(payload);
   });
 });

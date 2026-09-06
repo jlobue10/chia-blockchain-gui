@@ -19,7 +19,12 @@ import limit from '../util/limit';
 import CacheAPI from './constants/CacheAPI';
 import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
 import SharedDownloadBudgetSpentError from './utils/SharedDownloadBudgetSpentError';
-import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
+import downloadFile, {
+  MAX_FILE_SIZE_EXCEEDED_ERROR,
+  isTransientDownloadError,
+  normalizeMaxSize,
+  normalizeTimeout,
+} from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -131,6 +136,17 @@ function getInfoFilePath(filePath: string) {
   return `${filePath}${INFO_SUFFIX}`;
 }
 
+// The type the cache: response declares for a file. Only the media types the
+// preview renders are passed through from the remote header; anything else —
+// a document type, a script type, a type with parameters that are not a
+// charset, or nothing at all — is served as an opaque byte stream.
+const SERVED_CONTENT_TYPE = /^(image|video|audio|model)\/[\w.+-]+(?:;\s*charset=[\w-]+)?$/i;
+
+export function servedContentType(contentType: string | undefined): string {
+  const declared = contentType?.trim();
+  return declared && SERVED_CONTENT_TYPE.test(declared) ? declared : 'application/octet-stream';
+}
+
 export default class CacheManager extends EventEmitter {
   #cacheDirectory: string = './cache';
 
@@ -219,12 +235,19 @@ export default class CacheManager extends EventEmitter {
       }
 
       const contentTypeHeader = cacheInfo.headers?.['content-type'];
-      const contentType =
-        (Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader) || 'application/octet-stream';
+      const contentType = servedContentType(
+        Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader,
+      );
 
       const responseHeaders: Record<string, string> = {
         'content-type': contentType,
         'accept-ranges': 'bytes',
+        // The bytes and their declared type both come from whoever served the
+        // NFT's file. They are only ever shown through <img>, <video> and
+        // <audio>, so a response that could be read as a document — and its
+        // scripts — is denied here as well as by the renderer's policy.
+        'x-content-type-options': 'nosniff',
+        'content-security-policy': "default-src 'none'; sandbox",
       };
 
       // Media elements seek by sending Range requests. Without 206 responses
@@ -476,7 +499,7 @@ export default class CacheManager extends EventEmitter {
         (retries < MAX_TRANSIENT_RETRIES && Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
     // A persisted size-limit error is only retried when the caller lifts
     // the limit, so oversized files are not re-downloaded on every visit.
-    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
+    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize > MAX_FILE_SIZE;
     // An ipfs failure is a verdict on one gateway, not on the resource:
     // once the user points the option at another gateway the entry is
     // re-requested right away, whatever the error was and however
@@ -500,7 +523,10 @@ export default class CacheManager extends EventEmitter {
     options: CacheRequestOptions = {},
     budget = { remaining: normalizeDownloadDuration(options.maxDuration) },
   ): Promise<CacheInfo> {
-    const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
+    // Both come from the renderer and reach a timer and a byte counter; see
+    // the normalizers for what an absent, invalid or "unlimited" value means.
+    const maxSize = normalizeMaxSize(options.maxSize);
+    const timeout = normalizeTimeout(options.timeout);
 
     // Validate before coalescing, reading sidecars, or queuing network work.
     if (!isValidURL(url)) {
