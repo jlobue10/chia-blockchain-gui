@@ -1,5 +1,6 @@
 import FileType from '../../constants/FileType';
 import getFileType from '../../util/getFileType';
+import { isIpfsUrl } from '../../util/ipfs';
 import { catAssetIdToName } from '../api/catAssetIdToName';
 import { getOfferSummary } from '../api/getOfferSummary';
 import { getWalletInfos, type WalletInfo } from '../api/getWalletNames';
@@ -8,6 +9,7 @@ import { nftGetImageDataUrl, nftGetMetadata } from '../api/nftGetMetadata';
 import resolveAssetDisplayKind from '../api/resolveAssetDisplayKind';
 import WalletType from '../constants/WalletType';
 import type { DisplayWalletDelta, DisplayWalletDeltaItem } from '../dialogs/Confirm/Confirm';
+import { ipfsGatewayEnabled } from '../utils/ipfsGateway';
 import { isNumericKey } from '../utils/isNumericKey';
 import { isPlainObject } from '../utils/isPlainObject';
 import isValidURL from '../utils/isValidURL';
@@ -55,6 +57,26 @@ function hexToNftId(hex: string): string {
 // full per-fetch timeout each.
 const NFT_PREVIEW_RESOLUTION_BUDGET_MS = 20_000;
 
+// ...and at most this many fallbacks per URI list are tried at all. The lists
+// are minter-authored, and a deadline only bounds waiting: an attempt that
+// fails without ever reaching the network (an unfetchable URI, a refused
+// request) costs microseconds, so a deadline alone would let a long enough
+// list run its whole length. A count holds whatever an attempt costs.
+export const MAX_NFT_PREVIEW_URI_ATTEMPTS = 8;
+
+// The URIs of a minter-authored list the resolver will try: structurally
+// valid, and fetchable at all — with the gateway option off an ipfs:// URI is
+// refused before any request is made (toFetchableUrl), and such a refusal
+// happens synchronously in the fetcher's argument list, so a loop that
+// discovers it one URI at a time never yields to the event loop while it
+// works through the list. Dropping those URIs up front keeps every iteration
+// that remains a real network wait, which is what the deadline was sized for.
+function fetchableUris(uris: string[], ipfsFetchable: boolean): string[] {
+  return uris
+    .filter((uri) => isValidURL(uri) && (ipfsFetchable || !isIpfsUrl(uri)))
+    .slice(0, MAX_NFT_PREVIEW_URI_ATTEMPTS);
+}
+
 async function resolveVerifiedImage(
   uris: string[],
   expectedHash: string | undefined,
@@ -70,13 +92,11 @@ async function resolveVerifiedImage(
       return undefined;
     }
 
-    if (isValidURL(uri)) {
-      // URI lists are ordered fallbacks for the same content.
-      // eslint-disable-next-line no-await-in-loop -- Fallbacks must be tried in their declared order.
-      const dataUrl = await nftGetImageDataUrl(uri, expectedHash, timeLeft);
-      if (dataUrl) {
-        return dataUrl;
-      }
+    // URI lists are ordered fallbacks for the same content.
+    // eslint-disable-next-line no-await-in-loop -- Fallbacks must be tried in their declared order.
+    const dataUrl = await nftGetImageDataUrl(uri, expectedHash, timeLeft);
+    if (dataUrl) {
+      return dataUrl;
     }
   }
 
@@ -94,10 +114,13 @@ export async function resolveNftPreviewUrl(
   metadataHash: string | undefined,
 ): Promise<string | undefined> {
   const deadline = Date.now() + NFT_PREVIEW_RESOLUTION_BUDGET_MS;
-  const validDataUris = dataUris.filter((uri) => isValidURL(uri));
+  // read once per NFT, not once per URI: the preference is a synchronous
+  // file read
+  const ipfsFetchable = ipfsGatewayEnabled();
+  const validDataUris = dataUris.filter((uri) => isValidURL(uri) && (ipfsFetchable || !isIpfsUrl(uri)));
 
   const imageDataUrl = await resolveVerifiedImage(
-    validDataUris.filter((uri) => getFileType(uri) === FileType.IMAGE),
+    validDataUris.filter((uri) => getFileType(uri) === FileType.IMAGE).slice(0, MAX_NFT_PREVIEW_URI_ATTEMPTS),
     dataHash,
     deadline,
   );
@@ -106,26 +129,24 @@ export async function resolveNftPreviewUrl(
   }
 
   if (metadataHash) {
-    for (const metadataUri of metadataUris) {
+    for (const metadataUri of fetchableUris(metadataUris, ipfsFetchable)) {
       const timeLeft = deadline - Date.now();
       if (timeLeft <= 0) {
         break;
       }
 
-      if (isValidURL(metadataUri)) {
-        // Metadata URIs are ordered fallbacks for the same on-chain hash.
-        // eslint-disable-next-line no-await-in-loop -- Fallbacks must be tried in their declared order.
-        const metadata = await nftGetMetadata(metadataUri, metadataHash, timeLeft);
-        if (metadata) {
-          // eslint-disable-next-line no-await-in-loop -- Resolve each verified metadata fallback before moving on.
-          const previewDataUrl = await resolveVerifiedImage(
-            metadata.preview_image_uris ?? [],
-            metadata.preview_image_hash,
-            deadline,
-          );
-          if (previewDataUrl) {
-            return previewDataUrl;
-          }
+      // Metadata URIs are ordered fallbacks for the same on-chain hash.
+      // eslint-disable-next-line no-await-in-loop -- Fallbacks must be tried in their declared order.
+      const metadata = await nftGetMetadata(metadataUri, metadataHash, timeLeft);
+      if (metadata) {
+        // eslint-disable-next-line no-await-in-loop -- Resolve each verified metadata fallback before moving on.
+        const previewDataUrl = await resolveVerifiedImage(
+          fetchableUris(metadata.preview_image_uris ?? [], ipfsFetchable),
+          metadata.preview_image_hash,
+          deadline,
+        );
+        if (previewDataUrl) {
+          return previewDataUrl;
         }
       }
     }
@@ -135,7 +156,7 @@ export async function resolveNftPreviewUrl(
   // response MIME type decides whether it can be used; known non-image types
   // keep the placeholder.
   return resolveVerifiedImage(
-    validDataUris.filter((uri) => getFileType(uri) === FileType.UNKNOWN),
+    validDataUris.filter((uri) => getFileType(uri) === FileType.UNKNOWN).slice(0, MAX_NFT_PREVIEW_URI_ATTEMPTS),
     dataHash,
     deadline,
   );
