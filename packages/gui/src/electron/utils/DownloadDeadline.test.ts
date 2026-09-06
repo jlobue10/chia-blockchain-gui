@@ -1,7 +1,4 @@
-import DownloadDeadline, {
-  DEFAULT_DOWNLOAD_MAX_DURATION,
-  normalizeDownloadDuration,
-} from './DownloadDeadline';
+import DownloadDeadline, { DEFAULT_DOWNLOAD_MAX_DURATION, normalizeDownloadDuration } from './DownloadDeadline';
 
 describe('DownloadDeadline', () => {
   beforeEach(() => jest.useFakeTimers());

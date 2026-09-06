@@ -17,8 +17,8 @@ import ipfsToGatewayUrl, { getGatewayHost, getIpfsPathFromGatewayUrl, isIpfsBack
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
-import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
 import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
+import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -136,16 +136,11 @@ export default class CacheManager extends EventEmitter {
     {
       promise: Promise<CacheInfo>;
       abort: () => void;
-      deadline: DownloadDeadline;
       // for ipfs:// URLs: the gateway base the request was started through
       gateway?: string;
+      deadline: DownloadDeadline;
     }
   > = new Map();
-
-  // Shared with the cache-maintenance change in #3068. Its clear/migration
-  // operations populate this barrier; bundle reads must honor it just as
-  // getContent does there. It is otherwise unset on this independent branch.
-  private maintenance: Promise<void> | undefined;
 
   // URLs whose download failed transiently during this session. A persisted
   // transient failure is retried once per session and again whenever the retry
@@ -153,6 +148,8 @@ export default class CacheManager extends EventEmitter {
   // challenging host from being retried (and holding a download slot) on every
   // access in between.
   private transientFailureUrls: Set<string> = new Set();
+
+  private maintenance: Promise<void> | undefined;
 
   constructor(
     options: {
@@ -443,13 +440,25 @@ export default class CacheManager extends EventEmitter {
     }
   }
 
-  async fetchRemoteContent(url: string, options: CacheRequestOptions = {}): Promise<CacheInfo> {
+  async fetchRemoteContent(
+    url: string,
+    options: CacheRequestOptions = {},
+    budget = { remaining: normalizeDownloadDuration(options.maxDuration) },
+  ): Promise<CacheInfo> {
     const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
     // Validate before coalescing, reading sidecars, or queuing network work.
-    const maxDuration = normalizeDownloadDuration(options.maxDuration);
+    const maxDuration = Math.max(1, Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining));
 
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
+    }
+
+    // Recheck after each await: another maintenance operation may have been
+    // queued while this caller waited. No await separates the last check from
+    // registration below, so every request is either admitted or held back.
+    while (this.maintenance) {
+      // eslint-disable-next-line no-await-in-loop -- Serialize admission against maintenance.
+      await this.maintenance.catch(() => {});
     }
 
     // Captured once, up front, and pinned for the download itself (which may
@@ -464,6 +473,18 @@ export default class CacheManager extends EventEmitter {
     const requestGateway =
       isIpfsUrl(url) || (isIpfsBackedUrl(url) && ipfsGatewayEnabled()) ? ipfsGatewayBase() : undefined;
 
+    // Charge actual admitted work, including a joined transfer, exactly once
+    // per fetch decision. Rechecks after maintenance/gateway changes share this
+    // budget instead of receiving another full metadata allowance.
+    const consume = async (request: { promise: Promise<CacheInfo>; deadline: DownloadDeadline }) => {
+      try {
+        return await request.promise;
+      } finally {
+        // eslint-disable-next-line no-param-reassign -- Rechecks consume the caller's shared allowance.
+        budget.remaining = Math.max(0, budget.remaining - request.deadline.elapsed());
+      }
+    };
+
     const ongoingRequest = this.ongoingRequests.get(url);
     if (ongoingRequest) {
       log('Request already ongoing', url);
@@ -477,11 +498,11 @@ export default class CacheManager extends EventEmitter {
         // the current one by the gateway check below. Without this the
         // caller would inherit the old gateway's error until the retry delay
         // elapsed.
-        const lookAgain = () => this.fetchRemoteContent(url, options);
-        return ongoingRequest.promise.then(lookAgain, lookAgain);
+        const lookAgain = () => this.fetchRemoteContent(url, options, budget);
+        return consume(ongoingRequest).then(lookAgain, lookAgain);
       }
 
-      return ongoingRequest.promise;
+      return consume(ongoingRequest);
     }
 
     const abortController = new AbortController();
@@ -566,14 +587,12 @@ export default class CacheManager extends EventEmitter {
         const limitedRemoteFileDownload = async (): Promise<CacheInfo> => {
           const cacheFilePath = this.getCacheFilePath(url);
 
-          // One deadline for the whole slot, shared by the download and its
-          // gateway fallback: a host that held the connection for the full
-          // duration has already cost the most one URL may, and must not
-          // earn the gateway a second full-length attempt on top. Queue wait
-          // consumes no transfer allowance; the main-process timer also lets
-          // a later metadata caller shorten an already-active request.
+          // One active-transfer deadline covers the original host and fallback.
+          // Queue wait consumes no allowance; coalesced callers can tighten it.
+          if (budget.remaining <= 0) {
+            throw new Error('Request exceeded the shared download deadline');
+          }
           transferDeadline.start();
-
           const downloadOptions = {
             timeout,
             maxSize,
@@ -674,7 +693,7 @@ export default class CacheManager extends EventEmitter {
           ...(requestGateway === undefined ? {} : { gateway: requestGateway }),
         });
       } finally {
-        transferDeadline.dispose();
+        transferDeadline.finish();
         // Clearing may have allowed a replacement request under this key.
         if (this.ongoingRequests.get(url) === ongoingRequestEntry) {
           this.ongoingRequests.delete(url);
@@ -687,12 +706,12 @@ export default class CacheManager extends EventEmitter {
     ongoingRequestEntry = {
       abort: () => abortController.abort(),
       promise,
-      deadline: transferDeadline,
       gateway: requestGateway,
+      deadline: transferDeadline,
     };
     this.ongoingRequests.set(url, ongoingRequestEntry);
 
-    return promise;
+    return consume(ongoingRequestEntry);
   }
 
   // How many transient failures in a row the persisted outcome already

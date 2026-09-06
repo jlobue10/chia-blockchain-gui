@@ -29,14 +29,19 @@ describe('fetchMetadataFromUris', () => {
   it('starts no further fallback after the secondary admission budget expires', async () => {
     let now = Date.now();
     const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
-    const fetchOne = jest.fn().mockRejectedValueOnce(new Error('HTTP error: 503')).mockImplementationOnce(async () => {
-      // This may include queue time; the actual transfer still has its own cap.
-      now += METADATA_URI_BUDGET_MS;
-      throw new Error('Request timed out after 30000ms of inactivity');
-    }).mockResolvedValueOnce(METADATA);
+    const fetchOne = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('HTTP error: 503'))
+      .mockImplementationOnce(async () => {
+        // This may include queue time; the actual transfer still has its own cap.
+        now += METADATA_URI_BUDGET_MS;
+        throw new Error('Request timed out after 30000ms of inactivity');
+      })
+      .mockResolvedValueOnce(METADATA);
     try {
-      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI, 'https://mirror.example/m.json'], 'ab', fetchOne))
-        .rejects.toThrow('HTTP error: 503');
+      await expect(
+        fetchMetadataFromUris([HTTPS_URI, IPFS_URI, 'https://mirror.example/m.json'], 'ab', fetchOne),
+      ).rejects.toThrow('HTTP error: 503');
       expect(fetchOne).toHaveBeenCalledTimes(2);
     } finally {
       spy.mockRestore();
@@ -46,10 +51,13 @@ describe('fetchMetadataFromUris', () => {
   it('does not burn the fallback admission window in the first request queue', async () => {
     let now = Date.now();
     const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
-    const fetchOne = jest.fn().mockImplementationOnce(async () => {
-      now += 10 * METADATA_URI_BUDGET_MS;
-      throw new Error('HTTP error: 403');
-    }).mockResolvedValueOnce(METADATA);
+    const fetchOne = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        now += 10 * METADATA_URI_BUDGET_MS;
+        throw new Error('HTTP error: 403');
+      })
+      .mockResolvedValueOnce(METADATA);
     try {
       await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).resolves.toEqual(METADATA);
       expect(fetchOne).toHaveBeenCalledTimes(2);
@@ -62,13 +70,18 @@ describe('fetchMetadataFromUris', () => {
   it('keeps falling through while the admission budget lasts', async () => {
     let now = Date.now();
     const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
-    const fetchOne = jest.fn().mockRejectedValueOnce(new Error('HTTP error: 504')).mockImplementationOnce(async () => {
-      now += METADATA_URI_BUDGET_MS / 2;
-      throw new Error('HTTP error: 504');
-    }).mockResolvedValueOnce(METADATA);
+    const fetchOne = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('HTTP error: 504'))
+      .mockImplementationOnce(async () => {
+        now += METADATA_URI_BUDGET_MS / 2;
+        throw new Error('HTTP error: 504');
+      })
+      .mockResolvedValueOnce(METADATA);
     try {
-      await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI, 'https://mirror.example/m.json'], 'ab', fetchOne))
-        .resolves.toEqual(METADATA);
+      await expect(
+        fetchMetadataFromUris([HTTPS_URI, IPFS_URI, 'https://mirror.example/m.json'], 'ab', fetchOne),
+      ).resolves.toEqual(METADATA);
       expect(fetchOne).toHaveBeenCalledTimes(3);
     } finally {
       spy.mockRestore();
@@ -92,19 +105,26 @@ describe('fetchMetadataFromUris', () => {
   });
 
   it('reports the first failure when no checksum mismatch was observed', async () => {
-    const fetchOne = jest.fn().mockRejectedValueOnce(new Error('HTTP error: 504'))
+    const fetchOne = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('HTTP error: 504'))
       .mockRejectedValueOnce(new Error('IPFS gateway fetching is disabled'));
     await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).rejects.toThrow('HTTP error: 504');
   });
 
   it('reports checksum mismatch in preference to a download failure', async () => {
-    const fetchOne = jest.fn().mockRejectedValueOnce(new Error('HTTP error: 504'))
+    const fetchOne = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('HTTP error: 504'))
       .mockRejectedValueOnce(new Error(CHECKSUM_MISMATCH_ERROR));
     await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).rejects.toThrow(CHECKSUM_MISMATCH_ERROR);
   });
 
   it('continues after mismatch when another copy can match', async () => {
-    const fetchOne = jest.fn().mockRejectedValueOnce(new Error(CHECKSUM_MISMATCH_ERROR)).mockResolvedValueOnce(METADATA);
+    const fetchOne = jest
+      .fn()
+      .mockRejectedValueOnce(new Error(CHECKSUM_MISMATCH_ERROR))
+      .mockResolvedValueOnce(METADATA);
     await expect(fetchMetadataFromUris([HTTPS_URI, IPFS_URI], 'ab', fetchOne)).resolves.toEqual(METADATA);
   });
 
@@ -112,8 +132,9 @@ describe('fetchMetadataFromUris', () => {
     const fetchOne = jest.fn();
     await expect(fetchMetadataFromUris([], 'ab', fetchOne)).rejects.toThrow('No metadata URI');
     await expect(fetchMetadataFromUris(undefined, 'ab', fetchOne)).rejects.toThrow('No metadata URI');
-    await expect(fetchMetadataFromUris('not an array' as unknown as string[], 'ab', fetchOne))
-      .rejects.toThrow('No metadata URI');
+    await expect(fetchMetadataFromUris('not an array' as unknown as string[], 'ab', fetchOne)).rejects.toThrow(
+      'No metadata URI',
+    );
     expect(fetchOne).not.toHaveBeenCalled();
   });
 });
