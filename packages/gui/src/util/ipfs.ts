@@ -189,6 +189,20 @@ export function isIpfsBackedUrl(url: string): boolean {
   return getIpfsPathFromAnyUrl(url) !== undefined;
 }
 
+// The gateway a gateway link is served by: its hostname, less the `<CID>.ipfs.`
+// label of the subdomain form — `https://<CID>.ipfs.dweb.link/x` is served by
+// dweb.link, the same operator as `https://dweb.link/ipfs/<CID>/x`. Undefined
+// for anything that is not a URL.
+const SUBDOMAIN_GATEWAY_LABEL = /^[a-z0-9]{46,}\.ipfs\./i;
+
+export function getGatewayHost(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.replace(SUBDOMAIN_GATEWAY_LABEL, '');
+  } catch {
+    return undefined;
+  }
+}
+
 // Translates an ipfs:// URI to its HTTPS gateway equivalent. Anything else
 // (including an unusable bare `ipfs://`) is returned unchanged, so this can
 // wrap any URL right where it reaches the network layer. `gatewayBase` is a

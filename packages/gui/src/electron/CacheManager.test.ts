@@ -639,6 +639,12 @@ describe('CacheManager eviction', () => {
       'HTTP error: 403',
     ],
     [
+      // the same operator behind a subdomain: a retry through it would ask the host that just failed
+      'a subdomain link on the configured gateway host',
+      'https://bafybeiceg2gltyhlkukwetn26k7t2zdvthg4u4c6uj23rpni2adzgvo5si.ipfs.ipfs.io/img.png',
+      'HTTP error: 403',
+    ],
+    [
       'an aborted download',
       'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png',
       'Request aborted',
@@ -673,6 +679,30 @@ describe('CacheManager eviction', () => {
 
     await expect(cacheManager.getContent(url)).rejects.toThrow(message);
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('refetches a subdomain gateway link on another host through the configured gateway', async () => {
+    const payload = Buffer.from('cached payload');
+    const cid = 'bafybeiceg2gltyhlkukwetn26k7t2zdvthg4u4c6uj23rpni2adzgvo5si';
+    const url = `https://${cid}.ipfs.dweb.link/img.png`;
+    mockDownloadFile
+      .mockRejectedValueOnce(new Error('HTTP error: 502'))
+      .mockImplementationOnce(async (_url, localPath) => {
+        await fs.writeFile(localPath, payload);
+        return {
+          'content-type': 'image/png',
+        };
+      });
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+    expect(mockDownloadFile.mock.calls[1][2]).toMatchObject({ requestUrl: `https://ipfs.io/ipfs/${cid}/img.png` });
   });
 
   it('gives the gateway fallback only what is left of the download deadline', async () => {

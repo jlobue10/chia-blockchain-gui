@@ -1,6 +1,7 @@
 import ipfsToGatewayUrl, {
   DEFAULT_IPFS_GATEWAY_BASE,
   getIpfsPath,
+  getGatewayHost,
   getIpfsPathFromAnyUrl,
   getIpfsPathFromGatewayUrl,
   isIpfsBackedUrl,
@@ -330,5 +331,24 @@ describe('getIpfsPathFromAnyUrl / isIpfsBackedUrl', () => {
     expect(isIpfsBackedUrl(`ipfs://${CID_V1}`)).toBe(true);
     expect(isIpfsBackedUrl(`https://${CID_V1}.ipfs.dweb.link/020.png`)).toBe(true);
     expect(isIpfsBackedUrl('https://example.com/image.png')).toBe(false);
+  });
+});
+
+describe('getGatewayHost', () => {
+  it('is the hostname of a path-style link or gateway base', () => {
+    expect(getGatewayHost(`https://nftstorage.link/ipfs/${CID_V1}/x.png`)).toBe('nftstorage.link');
+    expect(getGatewayHost(DEFAULT_IPFS_GATEWAY_BASE)).toBe('ipfs.io');
+    expect(getGatewayHost('http://127.0.0.1:8080/ipfs/')).toBe('127.0.0.1');
+  });
+
+  it('is the gateway behind the CID label of a subdomain-style link', () => {
+    expect(getGatewayHost(`https://${CID_V1}.ipfs.dweb.link/x.png`)).toBe('dweb.link');
+    expect(getGatewayHost(`https://${CID_V1}.ipfs.ipfs.io/x.png`)).toBe('ipfs.io');
+    // a short label is a hostname of its own, not a CID
+    expect(getGatewayHost(`https://gw.ipfs.example.com/ipfs/${CID_V0}`)).toBe('gw.ipfs.example.com');
+  });
+
+  it('is undefined for something that is not a URL', () => {
+    expect(getGatewayHost('not a url')).toBeUndefined();
   });
 });

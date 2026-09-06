@@ -12,12 +12,7 @@ import type CacheInfo from '../@types/CacheInfo';
 import type CacheInfoBase from '../@types/CacheInfoBase';
 import type Headers from '../@types/Headers';
 import CacheState from '../constants/CacheState';
-import ipfsToGatewayUrl, {
-  getIpfsPathFromGatewayUrl,
-  isIpfsBackedUrl,
-  isIpfsUrl,
-  normalizeIpfsGatewayBase,
-} from '../util/ipfs';
+import ipfsToGatewayUrl, { getGatewayHost, getIpfsPathFromGatewayUrl, isIpfsBackedUrl, isIpfsUrl } from '../util/ipfs';
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
@@ -720,9 +715,10 @@ export default class CacheManager extends EventEmitter {
     }
 
     const fallbackUrl = ipfsToGatewayUrl(`ipfs://${ipfsPath}`, gatewayBase);
-    // the URL's own host is the configured gateway: nothing else to try
-    const ownBase = normalizeIpfsGatewayBase(url.slice(0, url.indexOf('/ipfs/') + 1));
-    if (fallbackUrl === url || ownBase === gatewayBase) {
+    // The URL is already served by the configured gateway — the same host in
+    // path style, or that host behind a `<CID>.ipfs.` subdomain — so a retry
+    // through it would ask the operator that just failed: nothing else to try.
+    if (fallbackUrl === url || getGatewayHost(url) === getGatewayHost(gatewayBase)) {
       return undefined;
     }
 
