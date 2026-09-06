@@ -2,6 +2,7 @@ import debug from 'debug';
 import React, { useMemo, useCallback, type ReactNode } from 'react';
 
 import useCache from '../../../hooks/useCache';
+import { MAX_URIS_PER_CANDIDATE } from '../../../util/getNFTPreviewStatusFromCache';
 import NFTFilterProvider from '../NFTFilterProvider';
 
 import NFTProviderContext from './NFTProviderContext';
@@ -179,13 +180,14 @@ export default function NFTProvider(props: NFTProviderProps) {
           // invalidate all previews
           const { preview_video_uris: previewVideoUris, preview_image_uris: previewImageUris } = metadata;
 
-          // Appended one by one: these arrays come from the NFT's metadata and
-          // can be as long as its author likes, and `push(...uris)` passes
-          // every element as an argument — past V8's argument limit that
-          // throws, and the catch below would swallow it, leaving the refresh
-          // the user asked for half done.
+          // These lists come from the NFT's metadata and can be as long as
+          // its author likes. Only the first MAX_URIS_PER_CANDIDATE of each
+          // were ever fetched (the verifier and the gallery sweep stop
+          // there), so only those can be cached and only those are
+          // invalidated: one cache round-trip per uri, bounded by the same
+          // cap, instead of one per entry in an unbounded list.
           [previewVideoUris, previewImageUris].forEach((uris) => {
-            uris?.forEach((uri: string) => {
+            uris?.slice(0, MAX_URIS_PER_CANDIDATE).forEach((uri: string) => {
               promises.push(invalidate(uri));
               invalidatedUris.push(uri);
             });
