@@ -741,6 +741,54 @@ describe('CacheManager eviction', () => {
     }
   });
 
+  it('refuses a caller whose shared budget is spent instead of expiring the download it would join', async () => {
+    const payload = Buffer.from('cached payload');
+    const url = 'https://example.com/nft.png';
+    let finishDownload!: () => Promise<void>;
+    let aborted = false;
+    mockDownloadFile.mockImplementationOnce(
+      (_url, localPath, options) =>
+        new Promise((resolve, reject) => {
+          options?.signal?.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(new Error('Request aborted'));
+            },
+            { once: true },
+          );
+          finishDownload = async () => {
+            await fs.writeFile(localPath, payload);
+            resolve({ 'content-type': 'image/png' });
+          };
+        }),
+    );
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    const first = cacheManager.getContent(url);
+    await untilDownloadsStarted(1);
+
+    // a recheck arrives with nothing left of its shared allowance: it is
+    // refused outright rather than seated on the transfer with a deadline
+    // that expires at once
+    await expect(cacheManager.fetchRemoteContent(url, {}, { remaining: 0 })).rejects.toThrow(
+      'shared download deadline',
+    );
+    expect(aborted).toBe(false);
+
+    await finishDownload();
+    await expect(first).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+    // the refusal recorded nothing: the entry is the completed download's
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info.state).toBe('CACHED');
+  });
+
   it('does not fall back to the gateway once the host has used up the whole download deadline', async () => {
     const url = 'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
     let now = Date.now();
