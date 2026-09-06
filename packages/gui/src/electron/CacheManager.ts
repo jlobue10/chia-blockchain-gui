@@ -17,8 +17,8 @@ import ipfsToGatewayUrl, { getGatewayHost, getIpfsPathFromGatewayUrl, isIpfsBack
 import limit from '../util/limit';
 
 import CacheAPI from './constants/CacheAPI';
-import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
 import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
+import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -452,12 +452,23 @@ export default class CacheManager extends EventEmitter {
     budget = { remaining: normalizeDownloadDuration(options.maxDuration) },
   ): Promise<CacheInfo> {
     const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
-    // Validate before coalescing, reading sidecars, or queuing network work.
-    const maxDuration = Math.max(1, Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining));
 
+    // Validate before coalescing, reading sidecars, or queuing network work.
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
+
+    // A shared budget that is already spent buys nothing: not a transfer of
+    // its own (the download path refuses one below) and not a seat on
+    // another caller's. Joining would tighten that transfer's deadline to
+    // the floor and abort a healthy download someone else is waiting on,
+    // recording a deadline error against the url on their behalf. Refuse
+    // here instead, and persist nothing: the cache knows no more about the
+    // url than it did.
+    if (budget.remaining <= 0) {
+      throw new Error('Request exceeded the shared download deadline');
+    }
+    const maxDuration = Math.min(normalizeDownloadDuration(options.maxDuration), budget.remaining);
 
     // Recheck after each await: another maintenance operation may have been
     // queued while this caller waited. No await separates the last check from
