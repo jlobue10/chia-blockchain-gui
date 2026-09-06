@@ -139,8 +139,8 @@ export default class CacheManager extends EventEmitter {
     }
   > = new Map();
 
-  // Clear and migration share one barrier. Waiters must not enter the request
-  // map until admitted: maintenance drains that map, so registering a waiter
+  // Clear, migration and invalidation share one barrier. Waiters must not enter
+  // the request map until admitted: maintenance drains that map, so a request
   // which itself awaits maintenance would create a circular wait.
   private maintenance: Promise<void> | undefined;
 
@@ -695,8 +695,8 @@ export default class CacheManager extends EventEmitter {
 
     if (cacheInfo.state === CacheState.CACHED) {
       if (this.maintenance) {
-        // A clear or migration began after the lookup settled, so what it
-        // found is stale: the file may be gone, or live in another directory
+        // Maintenance began after the lookup settled, so what it found is
+        // stale: the file may be gone, or live in another directory
         // by the time it is read. Look again once the maintenance is done —
         // a cleared entry is fetched afresh rather than read from nowhere.
         await this.waitForMaintenance();
@@ -710,9 +710,9 @@ export default class CacheManager extends EventEmitter {
     throw new Error('Unknown cache state');
   }
 
-  // Waits out every maintenance operation (clear, migration) in progress or
-  // queued. A failed operation is its caller's to report; here it only ends
-  // the wait.
+  // Waits out every maintenance operation (clear, migration, invalidation) in
+  // progress or queued. A failed operation is its caller's to report; here it
+  // only ends the wait.
   private async waitForMaintenance() {
     while (this.maintenance) {
       // eslint-disable-next-line no-await-in-loop -- another operation may have been queued while this one ran
@@ -813,12 +813,15 @@ export default class CacheManager extends EventEmitter {
 
   // Install the barrier before scheduling any work. A failed operation is
   // reported to its caller but must not poison subsequent maintenance/fetches.
-  private runMaintenance(operation: () => Promise<void>): Promise<void> {
+  // Invalidation drains only its URL; clear and migration must drain them all.
+  private runMaintenance(operation: () => Promise<void>, url?: string): Promise<void> {
     const previous = this.maintenance ?? Promise.resolve();
     const pending = previous
       .catch(() => {})
       .then(async () => {
-        const ongoing = Array.from(this.ongoingRequests.values());
+        const ongoing = Array.from(this.ongoingRequests.entries())
+          .filter(([requestUrl]) => url === undefined || requestUrl === url)
+          .map(([, request]) => request);
         ongoing.forEach((request) => request.abort());
         await Promise.allSettled(ongoing.map((request) => request.promise));
         await operation();
@@ -909,9 +912,8 @@ export default class CacheManager extends EventEmitter {
                 copiedSources.push(source);
               }
             } catch (error) {
-              // A source that vanished since the listing — deleted from outside,
-              // or by an invalidation that beat the barrier — has nothing to
-              // migrate; it must not fail the whole move.
+              // A source deleted from outside since the listing has nothing
+              // to migrate; it must not fail the whole move.
               if ((error as { code?: string }).code !== 'ENOENT') {
                 throw error;
               }
@@ -1031,26 +1033,18 @@ export default class CacheManager extends EventEmitter {
     if (!isValidURL(url)) {
       throw new Error(`Invalid URL: ${url}`);
     }
-    // cancel the ongoing request
-    const ongoingRequest = this.ongoingRequests.get(url);
-    if (ongoingRequest) {
-      ongoingRequest.abort();
-    }
 
-    // A migration copies the directory file by file and a clear empties it;
-    // deleting from under either would fail the copy pass, or remove from a
-    // directory that is about to stop being the cache. Apply the deletion to
-    // whatever directory is current once maintenance is done.
-    await this.waitForMaintenance();
+    // Register before the first await so a later migration cannot copy an
+    // entry while its deletion is underway. Drain this URL's complete request
+    // first: abort cleanup or a late success can still write its sidecar.
+    await this.runMaintenance(async () => {
+      // An earlier migration may have changed the directory while we waited.
+      const filePath = this.getCacheFilePath(url);
+      await safeUnlink(filePath);
+      await safeUnlink(getInfoFilePath(filePath));
 
-    // prepare invalidation
-    const filePath = this.getCacheFilePath(url);
-
-    // remove the file
-    await safeUnlink(filePath);
-    await safeUnlink(getInfoFilePath(filePath));
-
-    this.emit('sizeChanged');
+      this.emit('sizeChanged');
+    }, url);
   }
 
   async setMaxCacheSize(maxCacheSize: number | string) {

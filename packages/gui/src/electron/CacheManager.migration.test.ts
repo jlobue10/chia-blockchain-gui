@@ -1,4 +1,5 @@
 import { dialog } from 'electron';
+import { copyFileSync, lstatSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -207,6 +208,171 @@ describe('CacheManager directory migration', () => {
     // the entry was removed from the directory that is current once the migration finished
     expect(await fs.readdir(newDirectory)).toEqual([]);
     expect(await fs.readdir(oldDirectory)).toEqual([]);
+  });
+
+  it('keeps migration behind an invalidation whose deletion has already started', async () => {
+    const url = 'https://example.com/refresh-before-migration';
+    mockDownloadFile.mockImplementation(async (_url, file) => {
+      await fs.writeFile(file, 'complete');
+      return {};
+    });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    await cache.getContent(url);
+    await fs.mkdir(newDirectory);
+    const dataFile = (await fs.readdir(oldDirectory)).find((file) => file.endsWith('-chiacache'))!;
+    const source = path.join(oldDirectory, dataFile);
+    const deletionStarted = deferred();
+    const releaseDeletion = deferred();
+    let blocked = false;
+
+    // Keep the files real, but complete migration's filesystem calls in the
+    // microtask queue. One event-loop turn then lets an unguarded migration
+    // finish while unlink is held, independent of disk/thread-pool timing.
+    const statSpy = jest.spyOn(fs, 'stat').mockImplementation(async (file) => statSync(file));
+    const lstatSpy = jest.spyOn(fs, 'lstat').mockImplementation(async (file) => lstatSync(file));
+    const readdirSpy = jest.spyOn(fs, 'readdir').mockImplementation(async (directory) => readdirSync(directory) as any);
+    const copySpy = jest.spyOn(fs, 'copyFile').mockImplementation(async (...args) => copyFileSync(...args));
+    const unlinkSpy = jest.spyOn(fs, 'unlink').mockImplementation(async (file) => {
+      if (String(file) === source && !blocked) {
+        blocked = true;
+        deletionStarted.resolve();
+        await releaseDeletion.promise;
+      }
+      unlinkSync(file);
+    });
+    let invalidation: Promise<void> | undefined;
+    let migration: Promise<void> | undefined;
+    try {
+      invalidation = cache.invalidate(url);
+      await deletionStarted.promise;
+      migration = cache.setCacheDirectory();
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      expect(copySpy).not.toHaveBeenCalled();
+      expect(cache.cacheDirectory).toBe(oldDirectory);
+      releaseDeletion.resolve();
+      await Promise.all([invalidation, migration]);
+    } finally {
+      releaseDeletion.resolve();
+      await Promise.allSettled([invalidation, migration]);
+      unlinkSpy.mockRestore();
+      copySpy.mockRestore();
+      readdirSpy.mockRestore();
+      lstatSpy.mockRestore();
+      statSpy.mockRestore();
+    }
+
+    expect(cache.cacheDirectory).toBe(newDirectory);
+    expect(await fs.readdir(oldDirectory)).toEqual([]);
+    expect(await fs.readdir(newDirectory)).toEqual([]);
+    expect((await cache.getCacheInfos([url]))[0].state).toBe('NOT_CACHED');
+    expect((await cache.getContent(url)).toString()).toBe('complete');
+    expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['abort cleanup', 'late success'])('drains %s before invalidation removes the entry', async (completion) => {
+    const url = 'https://example.com/refresh-in-flight';
+    const started = deferred();
+    const aborted = deferred();
+    const finish = deferred();
+    mockDownloadFile.mockImplementation(async (_url, file, options) => {
+      await fs.writeFile(`${file}.tmp`, 'complete');
+      options?.signal?.addEventListener('abort', aborted.resolve, { once: true });
+      started.resolve();
+      await finish.promise;
+      if (completion === 'abort cleanup') {
+        await fs.unlink(`${file}.tmp`);
+        throw new Error('Request aborted');
+      }
+      // A transfer can have passed its last abort check. CacheManager still
+      // has to wait for its checksum and CACHED sidecar before deleting.
+      await fs.rename(`${file}.tmp`, file);
+      return {};
+    });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    const first = cache.fetchRemoteContent(url);
+    let invalidation: Promise<void> | undefined;
+    try {
+      await started.promise;
+      invalidation = cache.invalidate(url);
+      await aborted.promise;
+      finish.resolve();
+      await Promise.all([first, invalidation]);
+    } finally {
+      finish.resolve();
+      await Promise.allSettled([first, invalidation]);
+    }
+    expect(await fs.readdir(oldDirectory)).toEqual([]);
+    expect((await cache.getCacheInfos([url]))[0].state).toBe('NOT_CACHED');
+  });
+
+  it('holds a replacement outside invalidation while leaving an unrelated download running', async () => {
+    const url = 'https://example.com/refresh-target';
+    const started = deferred();
+    const aborted = deferred();
+    const finish = deferred();
+    const otherStarted = deferred();
+    const finishOther = deferred();
+    let otherAborted = false;
+    mockDownloadFile
+      .mockImplementationOnce(async (_url, file, options) => {
+        await fs.writeFile(`${file}.tmp`, 'partial');
+        options?.signal?.addEventListener('abort', aborted.resolve, { once: true });
+        started.resolve();
+        await finish.promise;
+        await fs.unlink(`${file}.tmp`);
+        throw new Error('Request aborted');
+      })
+      .mockImplementationOnce(async (_url, file, options) => {
+        await new Promise<void>((resolve, reject) => {
+          options?.signal?.addEventListener(
+            'abort',
+            () => {
+              otherAborted = true;
+              reject(new Error('Request aborted'));
+            },
+            { once: true },
+          );
+          finishOther.promise.then(resolve);
+          otherStarted.resolve();
+        });
+        await fs.writeFile(file, 'unrelated');
+        return {};
+      })
+      .mockImplementationOnce(async (_url, file) => {
+        await fs.writeFile(file, 'replacement');
+        return {};
+      });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    const first = cache.getContent(url).catch((error: Error) => error);
+    let other: Promise<Buffer | Error> | undefined;
+    let invalidation: Promise<void> | undefined;
+    let replacement: Promise<Buffer> | undefined;
+    try {
+      await started.promise;
+      other = cache.getContent('https://example.com/unrelated').catch((error: Error) => error);
+      await otherStarted.promise;
+      invalidation = cache.invalidate(url);
+      await aborted.promise;
+      replacement = cache.getContent(url);
+      expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+      finish.resolve();
+      await invalidation;
+      expect(await first).toBeInstanceOf(Error);
+      expect(otherAborted).toBe(false);
+      expect((await replacement).toString()).toBe('replacement');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(3);
+      finishOther.resolve();
+      expect((await other).toString()).toBe('unrelated');
+    } finally {
+      finish.resolve();
+      finishOther.resolve();
+      await Promise.allSettled([first, other, invalidation, replacement]);
+    }
   });
 
   it('carries on when a source file vanishes during the copy pass, and does not carry its orphaned data', async () => {
