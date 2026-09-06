@@ -1,5 +1,5 @@
 import { AlertDialog, ButtonLoading, Flex, Form, TextField, useOpenDialog } from '@chia-network/core';
-import { Trans } from '@lingui/macro';
+import { t, Trans } from '@lingui/macro';
 import React, { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 
@@ -21,7 +21,7 @@ export default function LimitCacheSize() {
     },
   });
 
-  const { reset } = methods;
+  const { reset, setError } = methods;
 
   useEffect(() => {
     if (maxCacheSize !== undefined) {
@@ -40,7 +40,19 @@ export default function LimitCacheSize() {
       return;
     }
 
-    const newValue = Number(values.maxCacheSize) * MB_SIZE;
+    // An emptied field reads as 0 (Number('') === 0), and zero would not
+    // limit the cache but switch eviction off — the main process refuses it,
+    // so say so here instead of submitting it.
+    const sizeInMiB = Number(values.maxCacheSize);
+    if (!Number.isFinite(sizeInMiB) || sizeInMiB <= 0) {
+      setError('maxCacheSize', {
+        type: 'validate',
+        message: t`Enter a cache size limit above 0 MiB`,
+      });
+      return;
+    }
+
+    const newValue = sizeInMiB * MB_SIZE;
 
     await setMaxCacheSize(newValue);
 
@@ -62,7 +74,7 @@ export default function LimitCacheSize() {
           size="small"
           InputProps={{
             inputProps: {
-              min: 0,
+              min: 1,
             },
           }}
         />

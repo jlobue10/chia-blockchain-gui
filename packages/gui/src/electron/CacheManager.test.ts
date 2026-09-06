@@ -238,28 +238,21 @@ describe('CacheManager eviction', () => {
     }
   });
 
-  it('treats a zero cache limit as unlimited when updating the setting', async () => {
-    const payload = Buffer.from('cached payload');
-    mockDownloadFile.mockImplementation(async (_url, localPath) => {
-      await fs.writeFile(localPath, payload);
-      return {
-        'content-type': 'image/png',
-      };
-    });
+  // Both eviction gates are `> 0`, so a zero limit would not mean "no cache"
+  // but "no eviction" — the renderer-reachable state SEC-866 was about.
+  it.each([0, '0', '', -1, Number.NaN, Number.POSITIVE_INFINITY])(
+    'refuses %p as a cache limit and keeps the current one',
+    async (limit) => {
+      const cacheManager = new CacheManager({
+        cacheDirectory,
+        maxCacheSize: 1024,
+      });
+      await cacheManager.init();
 
-    const cacheManager = new CacheManager({
-      cacheDirectory,
-      maxCacheSize: 1024,
-    });
-    await cacheManager.init();
-    await cacheManager.getContent('https://example.com/nft.png');
-
-    await cacheManager.setMaxCacheSize(0);
-
-    expect(cacheManager.maxCacheSize).toBe(0);
-    await expect(cacheManager.getContent('https://example.com/nft.png')).resolves.toEqual(payload);
-    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
-  });
+      await expect(cacheManager.setMaxCacheSize(limit)).rejects.toThrow('positive finite number');
+      expect(cacheManager.maxCacheSize).toBe(1024);
+    },
+  );
 
   // Downloads stream into `<file>.tmp` and rename into place; a quit or crash
   // mid-download leaves the temp file behind. Those files are the cache's too.
