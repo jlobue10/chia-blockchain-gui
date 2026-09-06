@@ -19,7 +19,12 @@ import limit from '../util/limit';
 import CacheAPI from './constants/CacheAPI';
 import DownloadDeadline, { normalizeDownloadDuration } from './utils/DownloadDeadline';
 import SharedDownloadBudgetSpentError from './utils/SharedDownloadBudgetSpentError';
-import downloadFile, { MAX_FILE_SIZE_EXCEEDED_ERROR, isTransientDownloadError } from './utils/downloadFile';
+import downloadFile, {
+  MAX_FILE_SIZE_EXCEEDED_ERROR,
+  isTransientDownloadError,
+  normalizeMaxSize,
+  normalizeTimeout,
+} from './utils/downloadFile';
 import ensureDirectoryExists from './utils/ensureDirectoryExists';
 import getChecksum from './utils/getChecksum';
 import ipcMainHandle from './utils/ipcMainHandle';
@@ -488,7 +493,7 @@ export default class CacheManager extends EventEmitter {
         (retries < MAX_TRANSIENT_RETRIES && Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
     // A persisted size-limit error is only retried when the caller lifts
     // the limit, so oversized files are not re-downloaded on every visit.
-    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
+    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize > MAX_FILE_SIZE;
     // An ipfs failure is a verdict on one gateway, not on the resource:
     // once the user points the option at another gateway the entry is
     // re-requested right away, whatever the error was and however
@@ -512,7 +517,10 @@ export default class CacheManager extends EventEmitter {
     options: CacheRequestOptions = {},
     budget = { remaining: normalizeDownloadDuration(options.maxDuration) },
   ): Promise<CacheInfo> {
-    const { maxSize = MAX_FILE_SIZE, timeout = 30_000 } = options;
+    // Both come from the renderer and reach a timer and a byte counter; see
+    // the normalizers for what an absent, invalid or "unlimited" value means.
+    const maxSize = normalizeMaxSize(options.maxSize);
+    const timeout = normalizeTimeout(options.timeout);
 
     // Validate before coalescing, reading sidecars, or queuing network work.
     if (!isValidURL(url)) {

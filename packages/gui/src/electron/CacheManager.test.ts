@@ -20,6 +20,8 @@ jest.mock('./utils/downloadFile', () => ({
   MAX_FILE_SIZE_EXCEEDED_ERROR: 'Maximum file size exceeded',
   DEFAULT_DOWNLOAD_MAX_DURATION: jest.requireActual('./utils/downloadFile').DEFAULT_DOWNLOAD_MAX_DURATION,
   isTransientDownloadError: jest.requireActual('./utils/downloadFile').isTransientDownloadError,
+  normalizeMaxSize: jest.requireActual('./utils/downloadFile').normalizeMaxSize,
+  normalizeTimeout: jest.requireActual('./utils/downloadFile').normalizeTimeout,
 }));
 
 const { DEFAULT_DOWNLOAD_MAX_DURATION } =
@@ -1124,6 +1126,44 @@ describe('CacheManager getCacheInfos', () => {
     expect(infos[1]).toMatchObject({ error: 'getaddrinfo ENOTFOUND example.com' });
     expect(infos[3]).toMatchObject({ error: 'Invalid URL: not a url' });
     expect(mockDownloadFile).not.toHaveBeenCalled();
+  });
+});
+
+describe('CacheManager request options from the renderer', () => {
+  let cacheDirectory: string;
+
+  beforeEach(async () => {
+    mockDownloadFile.mockReset();
+    cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'chia-cache-options-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(cacheDirectory, { recursive: true, force: true });
+  });
+
+  it.each([
+    // a request for "no limit" gets the ceiling, not an unbounded transfer
+    [{ maxSize: -1 }, { maxSize: 2 * 1024 * 1024 * 1024, timeout: 30_000 }],
+    [{ maxSize: 0 }, { maxSize: 2 * 1024 * 1024 * 1024, timeout: 30_000 }],
+    [{ maxSize: Number.NaN }, { maxSize: 100 * 1024 * 1024, timeout: 30_000 }],
+    [{ maxSize: 'huge' as unknown as number }, { maxSize: 100 * 1024 * 1024, timeout: 30_000 }],
+    // a timeout a timer cannot hold is clamped to the transfer ceiling
+    [{ timeout: 1e12 }, { maxSize: 100 * 1024 * 1024, timeout: 30 * 60 * 1000 }],
+    [{ timeout: 0 }, { maxSize: 100 * 1024 * 1024, timeout: 30_000 }],
+    [
+      { maxSize: 5 * 1024 * 1024, timeout: 10_000 },
+      { maxSize: 5 * 1024 * 1024, timeout: 10_000 },
+    ],
+  ])('hands the download %p as %p', async (options, expected) => {
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, 'bytes');
+      return { 'content-type': 'image/png' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    await cacheManager.getContent('https://example.com/nft.png', options);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+    expect(mockDownloadFile.mock.calls[0][2]).toMatchObject(expected);
   });
 });
 
