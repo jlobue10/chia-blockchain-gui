@@ -91,6 +91,22 @@ const MAX_FILE_SIZE = 1024 * 1024 * 100; // 100MB
 // enough that a gateway hiccup does not blank an NFT until the GUI restarts.
 export const TRANSIENT_ERROR_RETRY_DELAY = 10 * 60 * 1000; // 10 minutes
 
+// The delay doubles with every consecutive transient failure, up to this
+// ceiling, and after MAX_TRANSIENT_RETRIES failures in a row the entry settles
+// for good (until the NFT is refreshed or the cache cleared). Every URL here
+// is minter-authored, so a retry schedule must have a bound: with a fixed
+// delay a host that answers 503 forever would be re-probed every ten minutes
+// for as long as the wallet is open — a liveness beacon for whoever runs it.
+export const MAX_TRANSIENT_ERROR_RETRY_DELAY = 24 * 60 * 60 * 1000; // 1 day
+export const MAX_TRANSIENT_RETRIES = 8;
+
+// The wait before the next in-session retry of a URL that has failed
+// transiently `retries` times in a row: 10 min, 20 min, 40 min, ...
+export function transientErrorRetryDelay(retries: number): number {
+  const exponent = Math.max(0, Math.min(retries - 1, 31));
+  return Math.min(TRANSIENT_ERROR_RETRY_DELAY * 2 ** exponent, MAX_TRANSIENT_ERROR_RETRY_DELAY);
+}
+
 const SUFFIXES = [FILE_SUFFIX, `${FILE_SUFFIX}${INFO_SUFFIX}`];
 
 function isChiaCacheFile(filePath: string) {
@@ -440,6 +456,10 @@ export default class CacheManager extends EventEmitter {
 
     const abortController = new AbortController();
 
+    // the persisted outcome this attempt is retrying, if any — a transient
+    // failure recorded on top of an earlier one continues its retry count
+    let previousCacheInfo: CacheInfo | undefined;
+
     const process = async (): Promise<CacheInfo> => {
       try {
         // From isValidURL.ts
@@ -454,6 +474,7 @@ export default class CacheManager extends EventEmitter {
         }
 
         const cacheInfo = await this.getCacheInfoByURL(url);
+        previousCacheInfo = cacheInfo;
         if (cacheInfo.state === CacheState.CACHED) {
           log('Url already downloaded', url);
           return cacheInfo;
@@ -464,13 +485,20 @@ export default class CacheManager extends EventEmitter {
 
           const isAbortError = ['Response aborted', 'Request aborted'].includes(cacheInfo.error);
           // A persisted transient failure (timeout, 5xx, rate limit, bot
-          // challenge, network error) settles until the retry delay elapses
-          // or a new session starts — a one-off gateway problem must not
-          // disable the preview until the whole cache is cleared. Sidecars
-          // written without a timestamp fall back to the once-per-session rule.
+          // challenge, network error) is retried once per session, and again
+          // within the session once its retry delay has elapsed — a one-off
+          // gateway problem must not disable the preview until the whole
+          // cache is cleared. The delay grows with every consecutive failure
+          // and the in-session retries stop after MAX_TRANSIENT_RETRIES, so
+          // a host that never recovers is not re-probed every ten minutes for
+          // the life of the process. Sidecars written without a timestamp
+          // fall back to the once-per-session rule.
+          const retries = cacheInfo.retries ?? 0;
           const isRetriableTransientError =
             isTransientDownloadError(cacheInfo.error) &&
-            (!this.transientFailureUrls.has(url) || Date.now() - cacheInfo.timestamp >= TRANSIENT_ERROR_RETRY_DELAY);
+            (!this.transientFailureUrls.has(url) ||
+              (retries < MAX_TRANSIENT_RETRIES &&
+                Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
           // A persisted size-limit error is only retried when the caller lifts
           // the limit, so oversized files are not re-downloaded on every visit.
           const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize <= 0;
@@ -540,13 +568,15 @@ export default class CacheManager extends EventEmitter {
 
         const currentError = (error as Error) ?? new Error('Unknown fetchRemoteContent error');
 
-        if (isTransientDownloadError(currentError.message)) {
+        const isTransient = isTransientDownloadError(currentError.message);
+        if (isTransient) {
           this.transientFailureUrls.add(url);
         }
 
         return await this.setCacheInfo(url, {
           state: CacheState.ERROR,
           error: currentError.message,
+          ...(isTransient ? { retries: this.consecutiveTransientFailures(previousCacheInfo) + 1 } : {}),
         });
       } finally {
         this.ongoingRequests.delete(url);
@@ -561,6 +591,17 @@ export default class CacheManager extends EventEmitter {
     });
 
     return promise;
+  }
+
+  // How many transient failures in a row the persisted outcome already
+  // records — zero when there is none, or when the last outcome was anything
+  // other than a transient failure (a success, a settled error, an abort).
+  private consecutiveTransientFailures(previous: CacheInfo | undefined): number {
+    if (previous?.state !== CacheState.ERROR || !isTransientDownloadError(previous.error)) {
+      return 0;
+    }
+
+    return previous.retries ?? 0;
   }
 
   async getHeaders(

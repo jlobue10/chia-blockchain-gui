@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -25,8 +26,13 @@ jest.mock('./utils/ipcMainHandle', () => ({
   default: jest.fn(),
 }));
 
-const { default: CacheManager, TRANSIENT_ERROR_RETRY_DELAY } =
-  jest.requireActual<typeof import('./CacheManager')>('./CacheManager');
+const {
+  default: CacheManager,
+  TRANSIENT_ERROR_RETRY_DELAY,
+  MAX_TRANSIENT_ERROR_RETRY_DELAY,
+  MAX_TRANSIENT_RETRIES,
+  transientErrorRetryDelay,
+} = jest.requireActual<typeof import('./CacheManager')>('./CacheManager');
 
 describe('CacheManager eviction', () => {
   let cacheDirectory: string;
@@ -231,6 +237,110 @@ describe('CacheManager eviction', () => {
     } finally {
       nowSpy.mockRestore();
     }
+  });
+
+  it('waits twice as long before each further in-session retry of a transient error', async () => {
+    const url = 'https://example.com/nft.png';
+    const firstFailure = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(firstFailure);
+    mockDownloadFile.mockRejectedValue(new Error('HTTP error: 503'));
+
+    try {
+      const cacheManager = new CacheManager({
+        cacheDirectory,
+        maxCacheSize: 1024,
+      });
+      await cacheManager.init();
+
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      expect(await cacheManager.getCacheInfos([url])).toEqual([expect.objectContaining({ retries: 1 })]);
+
+      // first retry after the base delay, and it fails again
+      const secondFailure = firstFailure + transientErrorRetryDelay(1);
+      nowSpy.mockReturnValue(secondFailure);
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+      expect(await cacheManager.getCacheInfos([url])).toEqual([expect.objectContaining({ retries: 2 })]);
+
+      // the base delay is no longer enough...
+      nowSpy.mockReturnValue(secondFailure + transientErrorRetryDelay(1));
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+
+      // ...twice the base delay is
+      nowSpy.mockReturnValue(secondFailure + transientErrorRetryDelay(2));
+      await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 503');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(3);
+      expect(transientErrorRetryDelay(2)).toBe(2 * TRANSIENT_ERROR_RETRY_DELAY);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('stops retrying a transient error within the session after the retry cap, but still once per later session', async () => {
+    const url = 'https://example.com/nft.png';
+    let now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    mockDownloadFile.mockRejectedValue(new Error('net::ERR_CONNECTION_RESET'));
+
+    try {
+      const cacheManager = new CacheManager({
+        cacheDirectory,
+        maxCacheSize: 1024,
+      });
+      await cacheManager.init();
+
+      await expect(cacheManager.getContent(url)).rejects.toThrow('net::ERR_CONNECTION_RESET');
+      for (let attempt = 2; attempt <= MAX_TRANSIENT_RETRIES; attempt += 1) {
+        now += MAX_TRANSIENT_ERROR_RETRY_DELAY;
+        // eslint-disable-next-line no-await-in-loop -- consecutive retries
+        await expect(cacheManager.getContent(url)).rejects.toThrow('net::ERR_CONNECTION_RESET');
+        expect(mockDownloadFile).toHaveBeenCalledTimes(attempt);
+      }
+      expect(await cacheManager.getCacheInfos([url])).toEqual([
+        expect.objectContaining({ retries: MAX_TRANSIENT_RETRIES }),
+      ]);
+
+      // the cap is reached: however long the wallet stays open, no more probes
+      now += 100 * MAX_TRANSIENT_ERROR_RETRY_DELAY;
+      await expect(cacheManager.getContent(url)).rejects.toThrow('net::ERR_CONNECTION_RESET');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(MAX_TRANSIENT_RETRIES);
+
+      // a later session still gives the URL its one retry
+      const laterSession = new CacheManager({
+        cacheDirectory,
+        maxCacheSize: 1024,
+      });
+      await laterSession.init();
+      await expect(laterSession.getContent(url)).rejects.toThrow('net::ERR_CONNECTION_RESET');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(MAX_TRANSIENT_RETRIES + 1);
+      await expect(laterSession.getContent(url)).rejects.toThrow('net::ERR_CONNECTION_RESET');
+      expect(mockDownloadFile).toHaveBeenCalledTimes(MAX_TRANSIENT_RETRIES + 1);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('starts the retry count over when a transient failure follows a settled one', async () => {
+    const url = 'https://example.com/nft.png';
+    const urlHash = crypto.createHash('md5').update(url).digest('hex');
+    // a sidecar left by an earlier version, or by a failure that has since
+    // become permanent: the count belongs to an unbroken run of transient
+    // failures only
+    await fs.writeFile(
+      path.join(cacheDirectory, `${urlHash}-chiacache-info`),
+      JSON.stringify({ url, state: 'ERROR', error: 'Request aborted', timestamp: Date.now(), retries: 5 }),
+    );
+    mockDownloadFile.mockRejectedValue(new Error('HTTP error: 502'));
+
+    const cacheManager = new CacheManager({
+      cacheDirectory,
+      maxCacheSize: 1024,
+    });
+    await cacheManager.init();
+
+    await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 502');
+    expect(await cacheManager.getCacheInfos([url])).toEqual([expect.objectContaining({ retries: 1 })]);
   });
 
   it('keeps a missing resource settled across sessions', async () => {

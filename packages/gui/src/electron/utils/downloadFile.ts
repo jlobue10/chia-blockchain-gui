@@ -85,27 +85,58 @@ const HTTP_ERROR_PREFIX = 'HTTP error: ';
 // succeeds. 408/425/429 are the timeout, too-early and rate-limit statuses.
 const TRANSIENT_HTTP_STATUSES = new Set([403, 408, 425, 429]);
 
+// Server errors that describe the host itself rather than a passing
+// condition: it does not implement the request (501) or the protocol (505).
+// Every other 5xx — 500, 502, 503, 504, 507, Cloudflare's 52x — is a gateway
+// or origin that may well answer next time.
+const PERMANENT_HTTP_STATUSES = new Set([501, 505]);
+
+// Chromium network errors that are properties of the URL, not of the moment:
+// a name that does not resolve, a scheme or port the client refuses, a URL it
+// cannot parse, a redirect it will not follow. Re-requesting these could only
+// ever fail the same way, so they settle like a 404. Certificate errors
+// (net::ERR_CERT_*) are matched by prefix below for the same reason. Every
+// other net::ERR_* code — connection resets, QUIC/HTTP2 protocol errors,
+// net::ERR_BLOCKED_BY_RESPONSE for a challenge page that carries a
+// Cross-Origin-Resource-Policy header — keeps the benefit of the doubt.
+const PERMANENT_NET_ERRORS = new Set([
+  'net::ERR_NAME_NOT_RESOLVED',
+  'net::ERR_NAME_RESOLUTION_FAILED',
+  'net::ERR_ICANN_NAME_COLLISION',
+  'net::ERR_INVALID_URL',
+  'net::ERR_DISALLOWED_URL_SCHEME',
+  'net::ERR_UNKNOWN_URL_SCHEME',
+  'net::ERR_UNSAFE_PORT',
+  'net::ERR_UNSAFE_REDIRECT',
+  'net::ERR_INVALID_REDIRECT',
+  'net::ERR_TOO_MANY_REDIRECTS',
+  'net::ERR_BLOCKED_BY_CLIENT',
+  'net::ERR_BLOCKED_BY_ADMINISTRATOR',
+  'net::ERR_FILE_NOT_FOUND',
+]);
+
 /** Whether a persisted download failure describes a condition that can clear
  * on its own — a timeout, a gateway/server error, a rate limit or bot
  * challenge, or a Chromium network error — as opposed to a resource that is
- * gone for good (404, 410) or a local policy (size cap). CacheManager retries
+ * gone for good (404, 410), a host that cannot serve it (unresolvable name,
+ * bad certificate, 501) or a local policy (size cap). CacheManager retries
  * these after a cooling-off period instead of keeping the entry poisoned
- * until the whole cache is cleared. */
+ * until the whole cache is cleared. Every URL this classifies comes from NFT
+ * data the minter wrote, so a failure that can never clear must settle: a
+ * retry-eligible verdict on it would re-probe the minter's host for as long
+ * as the wallet is open. */
 export function isTransientDownloadError(message: string): boolean {
   if (isDownloadTimeoutError(message)) {
     return true;
   }
 
-  // Chromium network errors (net::ERR_CONNECTION_RESET, net::ERR_QUIC_PROTOCOL_ERROR,
-  // net::ERR_BLOCKED_BY_RESPONSE for a challenge page that carries a
-  // Cross-Origin-Resource-Policy header, ...)
   if (message.startsWith('net::ERR_')) {
-    return true;
+    return !PERMANENT_NET_ERRORS.has(message) && !message.startsWith('net::ERR_CERT_');
   }
 
   if (message.startsWith(HTTP_ERROR_PREFIX)) {
     const status = Number.parseInt(message.slice(HTTP_ERROR_PREFIX.length), 10);
-    return status >= 500 || TRANSIENT_HTTP_STATUSES.has(status);
+    return (status >= 500 && !PERMANENT_HTTP_STATUSES.has(status)) || TRANSIENT_HTTP_STATUSES.has(status);
   }
 
   return false;
