@@ -15,7 +15,8 @@ type Metadata = {
   image?: string;
   format?: string;
   name?: string;
-  sensitive_content?: 'false' | 'true' | true | false;
+  // CHIP-0007: a boolean, a string naming the kind of sensitive content, or a list of such strings
+  sensitive_content?: boolean | string | string[];
   minting_tool?: string;
   preview_video_uris?: string[];
   preview_video_hash?: string;
