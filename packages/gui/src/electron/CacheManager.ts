@@ -113,6 +113,17 @@ function getInfoFilePath(filePath: string) {
   return `${filePath}${INFO_SUFFIX}`;
 }
 
+// Whether a sidecar claims its data file is present. An unreadable sidecar is
+// left alone: the lookup path reports it on its own terms.
+async function isCachedSidecar(infoFilePath: string): Promise<boolean> {
+  try {
+    const info = JSON.parse(await fs.readFile(infoFilePath, 'utf-8')) as Partial<CacheInfo>;
+    return info.state === CacheState.CACHED;
+  } catch {
+    return false;
+  }
+}
+
 export default class CacheManager extends EventEmitter {
   #cacheDirectory: string = './cache';
 
@@ -849,6 +860,15 @@ export default class CacheManager extends EventEmitter {
 
     const newDirectory = result.filePaths[0];
 
+    // The picker opens on the current cache directory, so confirming it is the
+    // common way to change nothing. Decide that here: the barrier below aborts
+    // every download in flight before its operation runs, which is the price
+    // of a move, not of a no-op. The check inside the barrier still covers a
+    // migration that completes while this one waits its turn.
+    if (path.resolve(this.cacheDirectory) === path.resolve(newDirectory)) {
+      return;
+    }
+
     await this.runMaintenance(async () => {
       // Resolve the source inside the serialized operation, not before the
       // native picker: another migration may have completed while it was open.
@@ -901,11 +921,25 @@ export default class CacheManager extends EventEmitter {
 
         // A data file whose sidecar did not make it across cannot be served
         // (the cache never trusts bytes without their sidecar), so it is not
-        // carried over either; sidecars stand on their own, as ERROR entries do.
+        // carried over either. The reverse holds for a CACHED sidecar whose
+        // data file did not arrive: the cache would trust it and then fail to
+        // read the bytes, until the entry is invalidated or the cache cleared.
+        // Dropping it lets the next request fetch the entry afresh. Sidecars
+        // in any other state stand on their own, as ERROR entries do.
         const movedFiles = new Set(moved.map(({ file }) => file));
-        const orphans = moved.filter(
-          ({ file }) => !isChiaCacheInfoFile(file) && !movedFiles.has(getInfoFilePath(file)),
+        const orphanChecks = await Promise.all(
+          moved.map(async (entry) => {
+            const { file, destination } = entry;
+            if (!isChiaCacheInfoFile(file)) {
+              return movedFiles.has(getInfoFilePath(file)) ? undefined : entry;
+            }
+            if (movedFiles.has(file.slice(0, -INFO_SUFFIX.length))) {
+              return undefined;
+            }
+            return (await isCachedSidecar(destination)) ? entry : undefined;
+          }),
         );
+        const orphans = orphanChecks.filter((entry): entry is (typeof moved)[number] => entry !== undefined);
         await Promise.all(orphans.map(({ destination }) => safeUnlink(destination)));
         orphans.forEach((orphan) => moved.splice(moved.indexOf(orphan), 1));
       } catch (error) {

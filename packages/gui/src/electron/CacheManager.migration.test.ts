@@ -245,4 +245,88 @@ describe('CacheManager directory migration', () => {
     expect(await fs.readdir(oldDirectory)).toEqual([]);
     expect((await cache.getContent('https://example.com/eight')).toString()).toBe('complete');
   });
+
+  it('leaves downloads in flight alone when the picked folder is the current cache directory', async () => {
+    const started = deferred();
+    const finish = deferred();
+    let aborted = false;
+    mockDownloadFile.mockImplementation(async (_url, file, options) => {
+      await fs.writeFile(`${file}.tmp`, 'complete');
+      options?.signal?.addEventListener(
+        'abort',
+        () => {
+          aborted = true;
+        },
+        { once: true },
+      );
+      started.resolve();
+      await finish.promise;
+      await fs.rename(`${file}.tmp`, file);
+      return { 'content-type': 'image/png' };
+    });
+    // the picker opens on the current directory; confirming it is a no-op
+    (dialog.showOpenDialog as jest.Mock).mockResolvedValue({ canceled: false, filePaths: [oldDirectory] });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    const content = cache.getContent('https://example.com/nine');
+    await started.promise;
+    // settles while the download is still running: nothing waited for it, nothing aborted it
+    await expect(cache.setCacheDirectory()).resolves.toBeUndefined();
+    expect(aborted).toBe(false);
+    expect(cache.cacheDirectory).toBe(oldDirectory);
+    finish.resolve();
+    expect((await content).toString()).toBe('complete');
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+    expect(await fs.readdir(oldDirectory)).toHaveLength(2);
+  });
+
+  it('does not carry over a cached sidecar whose data file vanished during the copy pass', async () => {
+    mockDownloadFile.mockImplementation(async (url, file) => {
+      if (url.endsWith('/broken')) {
+        throw new Error('HTTP error: 404');
+      }
+      await fs.writeFile(file, 'complete');
+      return {};
+    });
+    const cache = new CacheManager({ cacheDirectory: oldDirectory });
+    await cache.init();
+    await cache.getContent('https://example.com/ten');
+    await cache.getContent('https://example.com/eleven');
+    // a failed download leaves a sidecar with no data file by design
+    await expect(cache.getContent('https://example.com/broken')).rejects.toThrow('HTTP error: 404');
+    const before = await fs.readdir(oldDirectory);
+    expect(before).toHaveLength(5);
+    const [dataOfOne] = before.filter((file) => !file.endsWith('-info'));
+
+    // the data file of one entry disappears from outside before it is copied,
+    // whichever order the directory lists the pair in
+    const realCopyFile = fs.copyFile.bind(fs);
+    const copySpy = jest.spyOn(fs, 'copyFile').mockImplementation(async (...args) => {
+      const [source] = args as Parameters<typeof fs.copyFile>;
+      if (String(source).endsWith(dataOfOne)) {
+        await fs.unlink(source);
+      }
+      return realCopyFile(...(args as Parameters<typeof fs.copyFile>));
+    });
+    try {
+      await expect(cache.setCacheDirectory()).resolves.toBeUndefined();
+    } finally {
+      copySpy.mockRestore();
+    }
+
+    expect(cache.cacheDirectory).toBe(newDirectory);
+    // the intact entry and the failed one's sidecar moved; the sidecar that
+    // lost its data file was not published as a cached entry with nothing to read
+    const migrated = await fs.readdir(newDirectory);
+    expect(migrated).toHaveLength(3);
+    expect(migrated.some((file) => file.startsWith(dataOfOne))).toBe(false);
+    expect(await fs.readdir(oldDirectory)).toEqual([]);
+    // ... so the entry is fetched afresh instead of failing on a missing file
+    const infos = await cache.getCacheInfos(['https://example.com/ten', 'https://example.com/eleven']);
+    expect(infos.map(({ state }) => state).sort()).toEqual(['CACHED', 'NOT_CACHED']);
+    const { url: urlOfOne } = infos.find(({ state }) => state === 'NOT_CACHED')!;
+    expect((await cache.getContent(urlOfOne)).toString()).toBe('complete');
+    expect(mockDownloadFile).toHaveBeenCalledTimes(4);
+    expect(await fs.readdir(newDirectory)).toHaveLength(5);
+  });
 });
