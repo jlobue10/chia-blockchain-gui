@@ -319,11 +319,14 @@ describe('CacheManager eviction', () => {
     await untilDownloadsStarted(1);
     await fs.writeFile(path.join(cacheDirectory, 'bbbb-chiacache'), Buffer.alloc(100));
 
+    // the download rejects while the clear is still waiting on it, so its
+    // expectation has to be attached before the clear runs
+    const pendingRejection = expect(pending).rejects.toThrow('Request aborted');
     await cacheManager.clearCache();
 
     // the clear waited for the aborted download to settle, so its temp file,
     // the sidecar its abort recorded and the rest of the cache are all gone
-    await expect(pending).rejects.toThrow('Request aborted');
+    await pendingRejection;
     expect(cleanedUpByDownload).toBe(true);
     await expect(fs.readdir(cacheDirectory)).resolves.toEqual([]);
   });
