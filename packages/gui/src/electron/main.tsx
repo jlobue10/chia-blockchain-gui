@@ -98,6 +98,17 @@ type ConfirmDialogResult = {
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch('disable-http-cache');
 
+// A URL without its fragment: what a window would actually load.
+function documentOf(target: string): string {
+  try {
+    const parsed = new URL(target);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return target;
+  }
+}
+
 // The cache: scheme serves NFT media to <img>/<video>/<audio> tags. Media
 // elements expect protocols to buffer their responses unless the scheme is
 // registered with stream: true, so without this video and audio playback
@@ -1003,6 +1014,20 @@ if (ensureSingleInstance() && ensureCorrectEnvironment()) {
             protocol: 'file:',
             slashes: true,
           });
+
+    // The window shows the bundled renderer and nothing else. A navigation
+    // away from that document — a link inside NFT content that found a way
+    // out of its sandbox, a dropped file, a submitted form — is refused, and
+    // a request to open a new window is denied: external links reach the
+    // system browser through LinkAPI.OPEN_EXTERNAL instead. Hash changes are
+    // in-page and never reach this handler.
+    const rendererDocument = documentOf(startUrl);
+    mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+      if (documentOf(navigationUrl) !== rendererDocument) {
+        event.preventDefault();
+      }
+    });
+    mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
     mainWindow.loadURL(startUrl);
   };

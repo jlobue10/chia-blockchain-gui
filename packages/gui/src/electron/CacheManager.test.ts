@@ -45,6 +45,7 @@ const {
   MAX_TRANSIENT_ERROR_RETRY_DELAY,
   MAX_TRANSIENT_RETRIES,
   transientErrorRetryDelay,
+  servedContentType,
 } = jest.requireActual<typeof import('./CacheManager')>('./CacheManager');
 
 // The download starts only after the sidecar has been read, so a test that
@@ -1123,5 +1124,61 @@ describe('CacheManager getCacheInfos', () => {
     expect(infos[1]).toMatchObject({ error: 'getaddrinfo ENOTFOUND example.com' });
     expect(infos[3]).toMatchObject({ error: 'Invalid URL: not a url' });
     expect(mockDownloadFile).not.toHaveBeenCalled();
+  });
+});
+
+describe('CacheManager cache: responses', () => {
+  let cacheDirectory: string;
+
+  beforeEach(async () => {
+    mockDownloadFile.mockReset();
+    cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'chia-cache-protocol-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(cacheDirectory, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['image/png', 'image/png'],
+    ['video/mp4; charset=binary', 'video/mp4; charset=binary'],
+    ['audio/ogg', 'audio/ogg'],
+    ['model/gltf-binary', 'model/gltf-binary'],
+    ['text/html', 'application/octet-stream'],
+    ['text/html; charset=utf-8', 'application/octet-stream'],
+    ['application/javascript', 'application/octet-stream'],
+    ['image/svg+xml; foo=bar', 'application/octet-stream'],
+    ['', 'application/octet-stream'],
+    [undefined, 'application/octet-stream'],
+  ])('serves a stored type of %p as %p', (stored, served) => {
+    expect(servedContentType(stored)).toBe(served);
+  });
+
+  it('serves cached bytes as an opaque, sandboxed, unsniffable response when the remote type is not media', async () => {
+    const payload = Buffer.from('<script>alert(1)</script>');
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'text/html' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/nft';
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    // what the tile is handed and what the protocol serves are the same file
+    const cacheUrl = await cacheManager.getURI(url);
+    expect(cacheUrl.startsWith('cache://')).toBe(true);
+
+    let handler: ((request: Request) => Promise<Response>) | undefined;
+    cacheManager.prepareProtocol({
+      handle: (_scheme: string, callback: (request: Request) => Promise<Response>) => {
+        handler = callback;
+      },
+    } as never);
+    const response = await handler!(new Request(cacheUrl));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('application/octet-stream');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox");
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(payload);
   });
 });
