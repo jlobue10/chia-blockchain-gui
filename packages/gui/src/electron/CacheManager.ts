@@ -136,15 +136,22 @@ function getInfoFilePath(filePath: string) {
   return `${filePath}${INFO_SUFFIX}`;
 }
 
-// The type the cache: response declares for a file. Only the media types the
-// preview renders are passed through from the remote header; anything else —
-// a document type, a script type, a type with parameters that are not a
-// charset, or nothing at all — is served as an opaque byte stream.
-const SERVED_CONTENT_TYPE = /^(image|video|audio|model)\/[\w.+-]+(?:;\s*charset=[\w-]+)?$/i;
+// The type the cache: response declares for a file. A media type the
+// preview renders — image, video, audio, model — is passed through from the
+// remote header with whatever parameters it carries (codecs, charset), as
+// long as they are well formed. Anything else — a document type, a script
+// type, nothing at all — is served as an opaque byte stream, which the
+// renderer's image and media elements still decode by sniffing, as they did
+// before the header was constrained, and which is never read as a document.
+const MEDIA_TYPE = /^(image|video|audio|model)\/[\w.+-]+$/i;
+const MEDIA_TYPE_PARAMETER = /^[\w.+-]+=(?:"[^"\r\n]*"|[^;\s"\r\n]+)$/;
 
 export function servedContentType(contentType: string | undefined): string {
-  const declared = contentType?.trim();
-  return declared && SERVED_CONTENT_TYPE.test(declared) ? declared : 'application/octet-stream';
+  const [type, ...parameters] = (contentType ?? '').split(';').map((part) => part.trim());
+  if (!MEDIA_TYPE.test(type) || !parameters.every((parameter) => MEDIA_TYPE_PARAMETER.test(parameter))) {
+    return 'application/octet-stream';
+  }
+  return [type, ...parameters].join('; ');
 }
 
 export default class CacheManager extends EventEmitter {
@@ -246,7 +253,6 @@ export default class CacheManager extends EventEmitter {
         // NFT's file. They are only ever shown through <img>, <video> and
         // <audio>, so a response that could be read as a document — and its
         // scripts — is denied here as well as by the renderer's policy.
-        'x-content-type-options': 'nosniff',
         'content-security-policy': "default-src 'none'; sandbox",
       };
 
