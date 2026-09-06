@@ -52,6 +52,9 @@ describe('isTransientDownloadError', () => {
     'net::ERR_QUIC_PROTOCOL_ERROR',
     'net::ERR_HTTP2_PROTOCOL_ERROR',
     'net::ERR_INTERNET_DISCONNECTED',
+    // offline, or a resolver hiccup, as often as a name that does not exist
+    'net::ERR_NAME_NOT_RESOLVED',
+    'net::ERR_NAME_RESOLUTION_FAILED',
     // an unknown network error keeps the benefit of the doubt
     'net::ERR_SOMETHING_NEW',
   ])('treats %p as transient', (message) => {
@@ -78,8 +81,6 @@ describe('isTransientDownloadError', () => {
   // a "transient" verdict re-probes it for as long as the wallet is open —
   // a failure that is a property of the URL must settle instead.
   it.each([
-    'net::ERR_NAME_NOT_RESOLVED',
-    'net::ERR_NAME_RESOLUTION_FAILED',
     'net::ERR_CERT_AUTHORITY_INVALID',
     'net::ERR_CERT_DATE_INVALID',
     'net::ERR_CERT_COMMON_NAME_INVALID',

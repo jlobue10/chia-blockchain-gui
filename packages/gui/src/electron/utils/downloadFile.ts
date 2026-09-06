@@ -91,18 +91,19 @@ const TRANSIENT_HTTP_STATUSES = new Set([403, 408, 425, 429]);
 // or origin that may well answer next time.
 const PERMANENT_HTTP_STATUSES = new Set([501, 505]);
 
-// Chromium network errors that are properties of the URL, not of the moment:
-// a name that does not resolve, a scheme or port the client refuses, a URL it
-// cannot parse, a redirect it will not follow. Re-requesting these could only
-// ever fail the same way, so they settle like a 404. Certificate errors
-// (net::ERR_CERT_*) are matched by prefix below for the same reason. Every
-// other net::ERR_* code — connection resets, QUIC/HTTP2 protocol errors,
-// net::ERR_BLOCKED_BY_RESPONSE for a challenge page that carries a
-// Cross-Origin-Resource-Policy header — keeps the benefit of the doubt.
+// Chromium network errors that are properties of the URL, not of the moment: a
+// scheme or port the client refuses, a URL it cannot parse, a redirect it will
+// not follow. Re-requesting these could only ever fail the same way, so they
+// settle like a 404. Certificate errors (net::ERR_CERT_*) are matched by prefix
+// below for the same reason. Every other net::ERR_* code — connection resets,
+// QUIC/HTTP2 protocol errors, net::ERR_BLOCKED_BY_RESPONSE for a challenge page
+// that carries a Cross-Origin-Resource-Policy header — keeps the benefit of the
+// doubt. So does a name that did not resolve: Chromium reports that for an
+// offline machine, a resolver timeout or a sleep/wake glitch as readily as for
+// a name that does not exist, and settling it would leave every preview a user
+// first opened offline broken until the cache is cleared. The retry schedule
+// in CacheManager bounds what a name that truly never resolves can cost.
 const PERMANENT_NET_ERRORS = new Set([
-  'net::ERR_NAME_NOT_RESOLVED',
-  'net::ERR_NAME_RESOLUTION_FAILED',
-  'net::ERR_ICANN_NAME_COLLISION',
   'net::ERR_INVALID_URL',
   'net::ERR_DISALLOWED_URL_SCHEME',
   'net::ERR_UNKNOWN_URL_SCHEME',
