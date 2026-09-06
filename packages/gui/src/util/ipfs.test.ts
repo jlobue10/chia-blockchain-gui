@@ -49,6 +49,17 @@ describe('getIpfsPath', () => {
     expect(getIpfsPath(`ipfs://${CID_V1}/image%20-%20one.jfif`)).toBe(`${CID_V1}/image%20-%20one.jfif`);
   });
 
+  // File names on chain are whatever the minter typed — Unicode, brackets,
+  // quotes — and were fetchable before the path check existed; the URL parser
+  // percent-encodes what needs it on the way out.
+  it.each([`${CID_V1}/图片.png`, `${CID_V1}/café.png`, `${CID_V1}/a[1].png`, `${CID_V1}/a{b}"c|d^e\`f.png`])(
+    'keeps the path %p as published',
+    (ipfsPath) => {
+      expect(getIpfsPath(`ipfs://${ipfsPath}`)).toBe(ipfsPath);
+      expect(ipfsToGatewayUrl(`ipfs://${ipfsPath}`)).toBe(new URL(`${DEFAULT_IPFS_GATEWAY_BASE}${ipfsPath}`).href);
+    },
+  );
+
   // The path is minter-authored and gets appended to a gateway base, so a
   // path that would resolve out from under the base — or that does not start
   // with a CID at all — is not IPFS content.
@@ -79,6 +90,7 @@ describe('isIpfsPath', () => {
     expect(isIpfsPath(`${CID_V0}/image.png`)).toBe(true);
     expect(isIpfsPath(`${CID_V1}/BatGAN_POAP_Miami_12.png`)).toBe(true);
     expect(isIpfsPath(`${CID_V1}/some-dir/file~1(2)!.jfif`)).toBe(true);
+    expect(isIpfsPath(`${CID_V1}/图片 [1].png`.replace(' ', '%20'))).toBe(true);
   });
 
   it('rejects dot segments, empty segments and a non-CID first segment', () => {

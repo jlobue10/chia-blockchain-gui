@@ -91,10 +91,14 @@ export function isIpfsUrl(url: string): boolean {
 
 // A CID is base58btc (v0) or base32/base36 (v1): letters and digits only.
 const CID_SEGMENT = /^[A-Za-z0-9]+$/;
-// One segment of a URL path (RFC 3986 pchar, percent-encoded bytes included).
-// No `/`, `\`, `?`, `#` or whitespace: the segment is appended to a gateway
-// base and must stay one segment of the path under it.
-const PATH_SEGMENT = /^[A-Za-z0-9._~!$&'()*+,;=:@%-]+$/;
+// What a path segment must not contain once it is appended to a gateway base:
+// a backslash (URL parsing turns it into a slash), whitespace or a control
+// character (a URL with either is not valid to begin with — a newline would be
+// stripped by the parser, a space refused by isValidURL). `/`, `?` and `#`
+// cannot occur: the path was split on the first and cut at the others.
+// Everything else — Unicode file names, brackets, quotes — is a legitimate
+// path character that NFTs use; the URL parser percent-encodes what needs it.
+const FORBIDDEN_IN_SEGMENT = /[\\\s\p{Cc}]/u;
 // `.`, `..` and their percent-encoded spellings, which URL resolution walks
 // back up — out of the gateway's /ipfs/ prefix.
 const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
@@ -106,7 +110,10 @@ const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
 export function isIpfsPath(ipfsPath: string): boolean {
   const [cid, ...segments] = ipfsPath.split('/');
 
-  return CID_SEGMENT.test(cid) && segments.every((segment) => PATH_SEGMENT.test(segment) && !DOT_SEGMENT.test(segment));
+  return (
+    CID_SEGMENT.test(cid) &&
+    segments.every((segment) => segment.length > 0 && !FORBIDDEN_IN_SEGMENT.test(segment) && !DOT_SEGMENT.test(segment))
+  );
 }
 
 // Returns the `<CID>[/path]` part of an ipfs:// URI, tolerating the redundant
