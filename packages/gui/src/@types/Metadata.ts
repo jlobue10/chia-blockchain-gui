@@ -1,15 +1,11 @@
+import type { NFTAttribute } from '@chia-network/api';
+
 type Metadata = {
-  attributes?: {
-    trait_type: string;
-    value: string;
-  }[];
+  attributes?: NFTAttribute[];
   collection?: {
-    name: string;
-    id: string;
-    attributes: {
-      trait_type: string;
-      value: string;
-    }[];
+    name?: string;
+    id?: string;
+    attributes?: NFTAttribute[];
   };
   description?: string;
   image?: string;
