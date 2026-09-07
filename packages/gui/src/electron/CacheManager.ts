@@ -1093,21 +1093,16 @@ export default class CacheManager extends EventEmitter {
       // is also the NFT's metadata — is not handed to a caller whose cap it
       // exceeds: the cap is what keeps the renderer from decoding and
       // parsing that much on its thread. The entry stays cached for the
-      // callers it fits. A file that is gone is left to the read below,
-      // which repairs the entry.
-      let cachedSize: number | undefined;
-      try {
-        // eslint-disable-next-line no-await-in-loop -- Size the file before reading it.
-        cachedSize = (await fs.stat(filePath)).size;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw this.redactCachePath(error);
+      // callers it fits. The size is taken inside the leased read, so that
+      // maintenance waits for it like for the read itself; a file that is
+      // gone fails the read, which repairs the entry below.
+      const maxSize = normalizeMaxSize(options.maxSize);
+      const read = fs.stat(filePath).then(({ size }) => {
+        if (size > maxSize) {
+          throw new Error(MAX_FILE_SIZE_EXCEEDED_ERROR);
         }
-      }
-      if (cachedSize !== undefined && cachedSize > normalizeMaxSize(options.maxSize)) {
-        throw new Error(MAX_FILE_SIZE_EXCEEDED_ERROR);
-      }
-      const read = fs.readFile(filePath);
+        return fs.readFile(filePath);
+      });
       // Register synchronously after the generation check. Maintenance waits
       // for this read before touching its files; eviction also skips the path.
       this.activeReads.set(read, { url, filePath });
