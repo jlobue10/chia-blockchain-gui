@@ -122,6 +122,11 @@ export function transientErrorRetryDelay(retries: number): number {
 // anything that could only come from somewhere else.
 export const MAX_CACHE_INFO_LOOKUPS = 1000;
 const CACHE_INFO_LOOKUP_CONCURRENCY = 16;
+// How many files a directory scan (size accounting, eviction) stats at a
+// time. Stat-ing every file at once stalls the main thread for the better
+// part of a second on a cache of a few hundred thousand entries, and the
+// scans run after every completed download.
+const FILE_STAT_CONCURRENCY = 64;
 
 // Every file the cache owns: the data file, its `-info` sidecar, and the
 // `.tmp` file a download streams into before it is renamed into place. The
@@ -1406,28 +1411,31 @@ export default class CacheManager extends EventEmitter {
 
     // Include the sidecar metadata in each entry's size so the eviction total
     // uses the same accounting as getCacheSize().
+    const statLimit = limit(FILE_STAT_CONCURRENCY);
     const fileStats = (
       await Promise.all(
-        filePaths.map(async (filePath) => {
-          try {
-            const stats = await fs.stat(filePath);
-            let infoSize = 0;
+        filePaths.map((filePath) =>
+          statLimit<{ filePath: string; size: number; mtime: Date } | undefined>(async () => {
             try {
-              infoSize = (await fs.stat(getInfoFilePath(filePath))).size;
-            } catch {
-              // A missing sidecar is cleaned up with the data file as usual.
-            }
+              const stats = await fs.stat(filePath);
+              let infoSize = 0;
+              try {
+                infoSize = (await fs.stat(getInfoFilePath(filePath))).size;
+              } catch {
+                // A missing sidecar is cleaned up with the data file as usual.
+              }
 
-            return {
-              filePath,
-              size: stats.size + infoSize,
-              mtime: stats.mtime,
-            };
-          } catch {
-            // Deleted by invalidation while scanning — nothing left to evict.
-            return undefined;
-          }
-        }),
+              return {
+                filePath,
+                size: stats.size + infoSize,
+                mtime: stats.mtime,
+              };
+            } catch {
+              // Deleted by invalidation while scanning — nothing left to evict.
+              return undefined;
+            }
+          }),
+        ),
       )
     ).filter((entry): entry is { filePath: string; size: number; mtime: Date } => entry !== undefined);
 
@@ -1494,14 +1502,17 @@ export default class CacheManager extends EventEmitter {
 
     // Invalidation and eviction delete files while this scan runs — a file
     // that vanished between readdir and stat no longer occupies space.
+    const statLimit = limit(FILE_STAT_CONCURRENCY);
     const fileSizes = await Promise.all(
-      filePaths.map(async (filePath) => {
-        try {
-          return (await fs.stat(filePath)).size;
-        } catch {
-          return 0;
-        }
-      }),
+      filePaths.map((filePath) =>
+        statLimit<number>(async () => {
+          try {
+            return (await fs.stat(filePath)).size;
+          } catch {
+            return 0;
+          }
+        }),
+      ),
     );
     const totalSize = fileSizes.reduce((sum, size) => sum + size, 0);
 

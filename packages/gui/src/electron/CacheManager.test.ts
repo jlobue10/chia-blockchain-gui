@@ -1565,6 +1565,50 @@ describe('CacheManager sidecar integrity and error redaction', () => {
   });
 });
 
+describe('CacheManager directory scans', () => {
+  let cacheDirectory: string;
+
+  beforeEach(async () => {
+    mockDownloadFile.mockReset();
+    cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'chia-cache-scan-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(cacheDirectory, { recursive: true, force: true });
+  });
+
+  it('stats a large cache a bounded number of files at a time', async () => {
+    await Promise.all(
+      Array.from({ length: 300 }, (_, i) => fs.writeFile(path.join(cacheDirectory, `f${i}-chiacache`), 'x')),
+    );
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 * 1024 });
+    await cacheManager.init();
+
+    const realStat = fs.stat.bind(fs);
+    let inFlight = 0;
+    let peak = 0;
+    const statSpy = jest.spyOn(fs, 'stat').mockImplementation(async (...args) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      try {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 1);
+        });
+        return await realStat(...(args as Parameters<typeof fs.stat>));
+      } finally {
+        inFlight -= 1;
+      }
+    });
+    try {
+      await expect(cacheManager.getCacheSize()).resolves.toBe(300);
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(64);
+  });
+});
+
 describe('CacheManager cache: responses', () => {
   let cacheDirectory: string;
 
