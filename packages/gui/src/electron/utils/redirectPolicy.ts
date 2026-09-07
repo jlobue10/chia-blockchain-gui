@@ -20,7 +20,7 @@ export const TOO_MANY_REDIRECTS_ERROR = 'Too many redirects';
 // Names that resolve on this machine or its network by convention:
 // localhost, mDNS (.local), the home-network zone, and the reserved
 // private-use domain.
-const LOCAL_NAME_SUFFIXES = ['.localhost', '.local', '.home.arpa', '.internal'];
+const LOCAL_NAMES = ['localhost', 'local', 'home.arpa', 'internal'];
 
 // Whether a host names this machine or a network no NFT resource lives on:
 // loopback, link-local, the private ranges, the unspecified and shared
@@ -42,7 +42,7 @@ function isPrivateIpv4(octets: number[]): boolean {
 
 export function isLocalOrPrivateHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/\.$/, '');
-  if (host === 'localhost' || LOCAL_NAME_SUFFIXES.some((suffix) => host.endsWith(suffix))) {
+  if (LOCAL_NAMES.some((name) => host === name || host.endsWith(`.${name}`))) {
     return true;
   }
 
