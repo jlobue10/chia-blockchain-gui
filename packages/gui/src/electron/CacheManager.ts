@@ -134,7 +134,10 @@ function getInfoFilePath(filePath: string) {
 // renderer's image and media elements still decode by sniffing, as they did
 // before the header was constrained, and which is never read as a document.
 const MEDIA_TYPE = /^(image|video|audio|model)\/[\w.+-]+$/i;
-const MEDIA_TYPE_PARAMETER = /^[\w.+-]+=(?:"[^"\r\n]*"|[^;\s"\r\n]+)$/;
+// A parameter is printable ASCII, quoted or bare: a NUL, a control character
+// or a code point outside Latin-1 is not a header value the response can
+// carry, and a value the response cannot carry would fail the whole file.
+const MEDIA_TYPE_PARAMETER = /^[\w.+-]+=(?:"[\x20-\x21\x23-\x7e]*"|[\x21\x23-\x3a\x3c-\x7e]+)$/;
 
 export function servedContentType(contentType: string | undefined): string {
   const [type, ...parameters] = (contentType ?? '').split(';').map((part) => part.trim());

@@ -11,6 +11,24 @@ export const DEFAULT_IPFS_GATEWAY_BASE = 'https://ipfs.io/ipfs/';
 // is the normalized base — see normalizeIpfsGatewayBase.
 export const NFT_IPFS_GATEWAY_URL_PREF = 'nftIpfsGatewayUrl';
 
+// The longest URL the structural validator accepts (validator's isURL). NFT
+// URIs come from the chain with no length limit, and every helper here runs
+// on them before validation, so a longer string is refused up front rather
+// than worked on: nothing past this length could ever be fetched.
+export const MAX_URL_LENGTH = 2084;
+
+// Trailing slashes removed in one pass. The obvious regex, /\/+$/, is
+// quadratic on a run of slashes that does not reach the end — a minter can
+// put tens of thousands of them in a URI, and the main process would stall
+// for seconds on each.
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+}
+
 // Plain http is accepted for a gateway on this machine only (a local Kubo
 // node serves http://127.0.0.1:8080 by default); everything else must be
 // https like every other NFT resource URL.
@@ -57,7 +75,7 @@ export function normalizeIpfsGatewayBase(input: string | undefined | null): stri
   }
 
   const trimmed = input.trim();
-  if (!trimmed) {
+  if (!trimmed || trimmed.length > MAX_URL_LENGTH) {
     return undefined;
   }
 
@@ -78,7 +96,7 @@ export function normalizeIpfsGatewayBase(input: string | undefined | null): stri
     return undefined;
   }
 
-  const basePath = parsed.pathname.replace(/\/+$/, '').replace(/\/ipfs$/i, '');
+  const basePath = trimTrailingSlashes(parsed.pathname).replace(/\/ipfs$/i, '');
 
   return `${parsed.origin}${basePath}/ipfs/`;
 }
@@ -123,12 +141,12 @@ export function isIpfsPath(ipfsPath: string): boolean {
 // the scheme does not name IPFS content (see isIpfsPath), so the URI is
 // treated like any other URL the gateway cannot serve.
 export function getIpfsPath(url: string): string | undefined {
-  if (!isIpfsUrl(url)) {
+  if (!isIpfsUrl(url) || url.length > MAX_URL_LENGTH) {
     return undefined;
   }
 
   const [, ipfsPath, query] = /^([^?#]*)(.*)$/s.exec(url.replace(IPFS_SCHEME, '').replace(/^ipfs\//i, '')) ?? [];
-  const trimmedPath = ipfsPath.replace(/\/+$/, '');
+  const trimmedPath = trimTrailingSlashes(ipfsPath);
 
   return trimmedPath.length > 0 && isIpfsPath(trimmedPath) ? `${trimmedPath}${query}` : undefined;
 }
