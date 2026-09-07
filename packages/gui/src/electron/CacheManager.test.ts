@@ -852,6 +852,46 @@ describe('CacheManager eviction', () => {
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
   });
 
+  it('serves every caller that shares a lookup of an entry that is already cached', async () => {
+    const payload = Buffer.from('shared bytes');
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'image/png' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/shared.png';
+    await cacheManager.getContent(url);
+
+    // several tiles ask for the same cached file at once: the first lookup
+    // finishes from the sidecar and never starts a transfer, and the others
+    // must still be answered
+    const results = await Promise.all([
+      cacheManager.getContent(url),
+      cacheManager.getContent(url, { maxDuration: 100 }),
+      cacheManager.getChecksum(url),
+      cacheManager.getURI(url),
+    ]);
+    expect(results[0]).toEqual(payload);
+    expect(results[1]).toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers a caller that shares a lookup of a settled failure', async () => {
+    mockDownloadFile.mockRejectedValue(new Error('HTTP error: 404'));
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/gone.png';
+    await expect(cacheManager.getContent(url)).rejects.toThrow('HTTP error: 404');
+
+    const results = await Promise.allSettled([
+      cacheManager.getContent(url),
+      cacheManager.getContent(url, { maxDuration: 100 }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(['rejected', 'rejected']);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses a joiner after its own allowance without ending the transfer it joined', async () => {
     const payload = Buffer.from('video bytes');
     const url = 'https://example.com/video.mp4';
