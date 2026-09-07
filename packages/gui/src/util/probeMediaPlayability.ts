@@ -25,20 +25,54 @@ const queuedProbes = new Set<() => void>();
 // an unplayable video would open another decoder probe.
 const verdicts = new Map<string, MediaPlayability>();
 
-function rememberVerdict(src: string, verdict: MediaPlayability) {
-  if (verdicts.size >= MAX_REMEMBERED_VERDICTS) {
-    // the map iterates in insertion order — evict the oldest verdict
-    const oldest = verdicts.keys().next().value;
+// An undecided probe — the file neither loaded nor failed within its time —
+// is not a property of the file, so it is not kept for good; but probing it
+// again on every remount would hold one of the few slots for the full
+// timeout each time, and a minter can make files that behave that way. It
+// is remembered for a short while instead, and the tile falls open to the
+// player as it would after the probe.
+export const UNKNOWN_VERDICT_TTL = 60_000;
+const unknownUntil = new Map<string, number>();
+
+function evictOldest(map: Map<string, unknown>) {
+  if (map.size >= MAX_REMEMBERED_VERDICTS) {
+    // the map iterates in insertion order — evict the oldest entry
+    const oldest = map.keys().next().value;
     if (oldest !== undefined) {
-      verdicts.delete(oldest);
+      map.delete(oldest);
     }
   }
+}
+
+function rememberVerdict(src: string, verdict: MediaPlayability) {
+  if (verdict === 'unknown') {
+    evictOldest(unknownUntil);
+    unknownUntil.set(src, Date.now() + UNKNOWN_VERDICT_TTL);
+    return;
+  }
+  evictOldest(verdicts);
   verdicts.set(src, verdict);
+}
+
+function rememberedVerdict(src: string): MediaPlayability | undefined {
+  const verdict = verdicts.get(src);
+  if (verdict) {
+    return verdict;
+  }
+  const until = unknownUntil.get(src);
+  if (until !== undefined) {
+    if (Date.now() < until) {
+      return 'unknown';
+    }
+    unknownUntil.delete(src);
+  }
+  return undefined;
 }
 
 /** For tests: forget every remembered verdict. */
 export function resetMediaPlayabilityVerdicts() {
   verdicts.clear();
+  unknownUntil.clear();
 }
 
 /**
@@ -62,8 +96,8 @@ export default function probeMediaPlayability(
 ): Promise<MediaPlayability> {
   const { timeout = DEFAULT_TIMEOUT, signal, createElement = (tag) => document.createElement(tag) } = options;
 
-  const remembered = verdicts.get(src);
-  if (remembered && remembered !== 'unknown') {
+  const remembered = rememberedVerdict(src);
+  if (remembered) {
     return Promise.resolve(remembered);
   }
 
@@ -99,7 +133,8 @@ export default function probeMediaPlayability(
       if (started) {
         activeProbes -= 1;
       }
-      if (verdict !== 'unknown') {
+      // an abort is the caller's doing, not a verdict on the file
+      if (verdict !== 'unknown' || !signal?.aborted) {
         rememberVerdict(src, verdict);
       }
       resolve(verdict);
@@ -111,7 +146,7 @@ export default function probeMediaPlayability(
     start = () => {
       queuedProbes.delete(start);
       // Another probe may have settled this file while this one was queued.
-      const cached = verdicts.get(src);
+      const cached = rememberedVerdict(src);
       if (cached) {
         settle(cached);
         return;

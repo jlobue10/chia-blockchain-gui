@@ -2,6 +2,7 @@ import probeMediaPlayability, {
   resetMediaPlayabilityVerdicts,
   MAX_CONCURRENT_MEDIA_PROBES,
   MAX_QUEUED_MEDIA_PROBES,
+  UNKNOWN_VERDICT_TTL,
 } from './probeMediaPlayability';
 
 type FakeMediaElement = HTMLVideoElement & {
@@ -182,15 +183,54 @@ describe('probeMediaPlayability', () => {
     expect(createElement).not.toHaveBeenCalled();
   });
 
-  it('probes again after an unknown verdict', async () => {
-    const first = fakeMediaElement(2);
-    const firstVerdict = probe(first, 'cache://flaky');
-    first.emit('error');
-    await expect(firstVerdict).resolves.toBe('unknown');
+  it('probes again after an unknown verdict, once its short memory has expired', async () => {
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const first = fakeMediaElement(2);
+      const firstVerdict = probe(first, 'cache://flaky');
+      first.emit('error');
+      await expect(firstVerdict).resolves.toBe('unknown');
 
-    const second = fakeMediaElement();
-    const secondVerdict = probe(second, 'cache://flaky');
-    second.emit('loadedmetadata');
-    await expect(secondVerdict).resolves.toBe('playable');
+      nowSpy.mockReturnValue(1_000_000 + UNKNOWN_VERDICT_TTL + 1);
+      const second = fakeMediaElement();
+      const secondVerdict = probe(second, 'cache://flaky');
+      second.emit('loadedmetadata');
+      await expect(secondVerdict).resolves.toBe('playable');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('remembers an undecided probe for a while so a remount does not hold a slot again', async () => {
+    jest.useFakeTimers();
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const created: FakeMediaElement[] = [];
+      const createElement = () => {
+        const element = fakeMediaElement();
+        created.push(element);
+        return element as unknown as HTMLMediaElement;
+      };
+      const first = probeMediaPlayability('cache://slow-chiacache', 'video', { createElement, timeout: 100 });
+      jest.advanceTimersByTime(100);
+      await expect(first).resolves.toBe('unknown');
+      expect(created).toHaveLength(1);
+
+      // the same file again, moments later: no new element, same answer
+      await expect(probeMediaPlayability('cache://slow-chiacache', 'video', { createElement })).resolves.toBe(
+        'unknown',
+      );
+      expect(created).toHaveLength(1);
+
+      // ... and once the memory has expired, it is probed afresh
+      nowSpy.mockReturnValue(1_000_000 + UNKNOWN_VERDICT_TTL + 1);
+      const later = probeMediaPlayability('cache://slow-chiacache', 'video', { createElement });
+      expect(created).toHaveLength(2);
+      created[1].emit('loadedmetadata');
+      await expect(later).resolves.toBe('playable');
+    } finally {
+      nowSpy.mockRestore();
+      jest.useRealTimers();
+    }
   });
 });

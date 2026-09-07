@@ -130,8 +130,15 @@ export type NFTPreviewProps = {
 // hold, a render error here is shown in place of the preview; without this
 // the nearest boundary is the one around the whole app, and one NFT in the
 // wallet would replace the gallery with the crash page on every load.
-class NFTPreviewErrorBoundary extends React.Component<{ children: ReactNode }, { failed: boolean }> {
-  constructor(props: { children: ReactNode }) {
+type NFTPreviewErrorBoundaryProps = {
+  children: ReactNode;
+  width: number | string;
+  height: number | string;
+  ratio: number;
+};
+
+class NFTPreviewErrorBoundary extends React.Component<NFTPreviewErrorBoundaryProps, { failed: boolean }> {
+  constructor(props: NFTPreviewErrorBoundaryProps) {
     super(props);
     this.state = { failed: false };
   }
@@ -146,10 +153,15 @@ class NFTPreviewErrorBoundary extends React.Component<{ children: ReactNode }, {
 
   render() {
     if (this.state.failed) {
+      // the same box the preview would have filled, so the tile keeps its
+      // place in the grid
+      const { width, height, ratio } = this.props;
       return (
-        <IconMessage icon={<NotInterested fontSize="large" />}>
-          <Trans>Preview cannot be shown</Trans>
-        </IconMessage>
+        <StyledCardPreview width={width} height={height} sx={{ aspectRatio: ratio.toString() }}>
+          <IconMessage icon={<NotInterested fontSize="large" />}>
+            <Trans>Preview cannot be shown</Trans>
+          </IconMessage>
+        </StyledCardPreview>
       );
     }
     return this.props.children;
@@ -159,8 +171,9 @@ class NFTPreviewErrorBoundary extends React.Component<{ children: ReactNode }, {
 export default function NFTPreview(props: NFTPreviewProps) {
   // keyed by the NFT: a failure is that NFT's, and the boundary starts
   // afresh when the same tile (the detail view's arrows) shows another
+  const { width = '100%', height = 'auto', ratio = 1 } = props;
   return (
-    <NFTPreviewErrorBoundary key={props.id}>
+    <NFTPreviewErrorBoundary key={props.id} width={width} height={height} ratio={ratio}>
       <NFTPreviewContent {...props} />
     </NFTPreviewErrorBoundary>
   );
