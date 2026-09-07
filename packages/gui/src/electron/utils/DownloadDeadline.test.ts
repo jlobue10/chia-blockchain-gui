@@ -65,3 +65,20 @@ describe('DownloadDeadline', () => {
     expect(abort).not.toHaveBeenCalled();
   });
 });
+
+describe('DownloadDeadline.whenStarted', () => {
+  it('resolves when the transfer starts, and at once if it already has', async () => {
+    const deadline = new DownloadDeadline(1000, () => {});
+    let started = false;
+    const waited = deadline.whenStarted().then(() => {
+      started = true;
+    });
+    await Promise.resolve();
+    expect(started).toBe(false);
+    deadline.start();
+    await waited;
+    expect(started).toBe(true);
+    await expect(deadline.whenStarted()).resolves.toBeUndefined();
+    deadline.finish();
+  });
+});

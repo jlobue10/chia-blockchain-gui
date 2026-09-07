@@ -1,3 +1,5 @@
+import type { NFTAttribute } from '@chia-network/api';
+
 import type Metadata from '../@types/Metadata';
 
 export const INVALID_METADATA_ERROR = 'Invalid metadata';
@@ -5,6 +7,15 @@ export const INVALID_METADATA_ERROR = 'Invalid metadata';
 // The longest URL the structural validator accepts; a longer one could
 // never be fetched, so it is dropped here rather than carried around.
 const MAX_URI_LENGTH = 2084;
+
+// Bounds on what a metadata file may make the GUI hold and render. A file
+// of the allowed size can hold hundreds of thousands of attributes or a
+// million short uris; the views map every entry into the DOM, and the
+// verifiers only ever look at the first few uris of a list.
+export const MAX_METADATA_ATTRIBUTES = 200;
+export const MAX_METADATA_URIS = 50;
+export const MAX_METADATA_NAME_LENGTH = 1024;
+export const MAX_METADATA_TEXT_LENGTH = 16 * 1024;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -26,29 +37,55 @@ function asText(value: unknown): string | undefined {
   return undefined;
 }
 
+function asBoundedText(value: unknown, maxLength: number): string | undefined {
+  const text = asText(value);
+  return text !== undefined && text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
 function asUris(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
-  return value.filter(
-    (uri): uri is string => typeof uri === 'string' && uri.length > 0 && uri.length <= MAX_URI_LENGTH,
-  );
+  return value
+    .filter((uri): uri is string => typeof uri === 'string' && uri.length > 0 && uri.length <= MAX_URI_LENGTH)
+    .slice(0, MAX_METADATA_URIS);
 }
 
-function asAttributes(value: unknown): { trait_type: string; value: string }[] | undefined {
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+// An attribute names a trait (trait_type, or name in older files) and holds
+// a value; a ranking attribute also carries numeric bounds, which the
+// rankings view relies on and which stay numbers. Values keep their type:
+// the views show them as text, the ranking check needs the numbers.
+function asAttributes(value: unknown): NFTAttribute[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
-  const attributes: { trait_type: string; value: string }[] = [];
-  value.forEach((entry) => {
-    if (!isPlainObject(entry)) {
+  const attributes: NFTAttribute[] = [];
+  value.slice(0, MAX_METADATA_ATTRIBUTES * 4).forEach((entry) => {
+    if (attributes.length >= MAX_METADATA_ATTRIBUTES || !isPlainObject(entry)) {
       return;
     }
-    const traitType = asText(entry.trait_type);
-    const traitValue = asText(entry.value);
-    if (traitType !== undefined && traitValue !== undefined) {
-      attributes.push({ trait_type: traitType, value: traitValue });
+    const traitType = asBoundedText(entry.trait_type, MAX_METADATA_NAME_LENGTH);
+    const name = asBoundedText(entry.name, MAX_METADATA_NAME_LENGTH);
+    const traitValue =
+      typeof entry.value === 'number' && Number.isFinite(entry.value)
+        ? entry.value
+        : asBoundedText(entry.value, MAX_METADATA_NAME_LENGTH);
+    if ((traitType === undefined && name === undefined) || traitValue === undefined) {
+      return;
     }
+    attributes.push(
+      withoutUndefined({
+        trait_type: traitType,
+        name,
+        value: traitValue,
+        min_value: asFiniteNumber(entry.min_value),
+        max_value: asFiniteNumber(entry.max_value),
+      }),
+    );
   });
   return attributes;
 }
@@ -72,8 +109,8 @@ export default function normalizeMetadata(parsed: unknown): Metadata {
   const collection = isPlainObject(parsed.collection)
     ? withoutUndefined({
         ...parsed.collection,
-        name: asText(parsed.collection.name),
-        id: asText(parsed.collection.id),
+        name: asBoundedText(parsed.collection.name, MAX_METADATA_NAME_LENGTH),
+        id: asBoundedText(parsed.collection.id, MAX_METADATA_NAME_LENGTH),
         attributes: asAttributes(parsed.collection.attributes),
       })
     : undefined;
@@ -92,11 +129,11 @@ export default function normalizeMetadata(parsed: unknown): Metadata {
 
   return withoutUndefined({
     ...parsed,
-    name: asText(parsed.name),
-    description: asText(parsed.description),
+    name: asBoundedText(parsed.name, MAX_METADATA_NAME_LENGTH),
+    description: asBoundedText(parsed.description, MAX_METADATA_TEXT_LENGTH),
     image: asString(parsed.image),
     format: asString(parsed.format),
-    minting_tool: asText(parsed.minting_tool),
+    minting_tool: asBoundedText(parsed.minting_tool, MAX_METADATA_NAME_LENGTH),
     sensitive_content: sensitive,
     attributes: asAttributes(parsed.attributes),
     collection,

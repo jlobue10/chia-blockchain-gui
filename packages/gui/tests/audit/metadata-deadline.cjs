@@ -256,29 +256,39 @@ test('a first metadata request queued longer than its allowance still gets its f
     clock.advance(1);
     await failure;
   }));
-test('metadata joining an active video-sized request tightens from the original start', async () =>
+test('metadata joining an active video-sized request gives up after its own allowance and leaves the transfer running', async () =>
   withManager(async ({ manager, requests, clock }) => {
     const first = manager.getContent('https://test.invalid/shared');
-    const rejected = assert.rejects(first, /download deadline/);
     await spin(() => requests.length === 1);
     clock.advance(80);
     const joined = manager.getContent('https://test.invalid/shared', { maxDuration: 100 });
-    const joinedRejected = assert.rejects(joined, /download deadline/);
-    clock.advance(19);
+    const joinedRejected = assert.rejects(joined, /shared download deadline/);
+    await spin(() => manager.ongoingRequests.size === 1);
+    clock.advance(99);
     assert.equal(requests[0].aborted, false);
     clock.advance(1);
-    await Promise.all([rejected, joinedRejected]);
+    await joinedRejected;
+    // the transfer another caller is waiting on was not touched
+    assert.equal(requests[0].aborted, false);
     assert.equal(requests.length, 1);
+    requests[0].succeed('{}');
+    await first;
   }));
-test('joining after the shorter allowance is already consumed aborts immediately', async () =>
+test('joining a transfer that has run longer than the allowance is refused after the allowance, not at once', async () =>
   withManager(async ({ manager, requests, clock }) => {
     const first = manager.getContent('https://test.invalid/late');
-    const r1 = assert.rejects(first, /deadline/);
     await spin(() => requests.length === 1);
     clock.advance(200);
-    const r2 = assert.rejects(manager.getContent('https://test.invalid/late', { maxDuration: 100 }), /deadline/);
-    assert.equal(requests[0].aborted, true);
-    await Promise.all([r1, r2]);
+    const joined = manager.getContent('https://test.invalid/late', { maxDuration: 100 });
+    const r2 = assert.rejects(joined, /shared download deadline/);
+    await spin(() => manager.ongoingRequests.size === 1);
+    clock.advance(99);
+    assert.equal(requests[0].aborted, false);
+    clock.advance(1);
+    await r2;
+    assert.equal(requests[0].aborted, false);
+    requests[0].succeed('{}');
+    await first;
   }));
 test('longer coalesced callers cannot extend a short deadline', async () =>
   withManager(async ({ manager, requests, clock }) => {
@@ -289,22 +299,26 @@ test('longer coalesced callers cannot extend a short deadline', async () =>
     clock.advance(50);
     await Promise.all([r1, r2]);
   }));
-test('queued coalesced callers retain their tighter budget without spending it in the queue', async () =>
+test('a joiner of a queued transfer is not charged for the queue wait, and gives up after its allowance once the transfer runs', async () =>
   withManager(async ({ manager, requests, clock }) => {
     const video = manager.getContent('https://test.invalid/queue-video');
     await spin(() => requests.length === 1);
     const queued = manager.getContent('https://test.invalid/shared-queue');
-    const r1 = assert.rejects(queued, /deadline/);
     const joined = manager.getContent('https://test.invalid/shared-queue', { maxDuration: 100 });
-    const r2 = assert.rejects(joined, /deadline/);
+    const r2 = assert.rejects(joined, /shared download deadline/);
     await spin(() => manager.ongoingRequests.size === 2);
     clock.advance(1000);
     assert.equal(requests.length, 1);
     requests[0].succeed('{}');
     await video;
     await spin(() => requests.length === 2);
-    clock.advance(100);
-    await Promise.all([r1, r2]);
+    clock.advance(99);
+    assert.equal(requests[1].aborted, false);
+    clock.advance(1);
+    await r2;
+    assert.equal(requests[1].aborted, false);
+    requests[1].succeed('{}');
+    await queued;
   }));
 test('content+headers+checksum returns a single network result and hashes returned bytes', async () =>
   withManager(async ({ manager, requests }) => {
@@ -448,19 +462,22 @@ test('gateway fallback consumes only the remaining metadata deadline', async () 
     assert.equal(requests[1].aborted, true);
     assert.equal(manager.ongoingRequests.size, 0);
   }));
-test('joining an active fallback tightens the original transfer start', async () =>
+test('joining an active fallback is bounded by the joining allowance and leaves the fallback running', async () =>
   withManager(async ({ manager, requests, clock }) => {
     const url = 'https://nftstorage.link/ipfs/bafybeigdyrztest/join.json';
-    const first = assert.rejects(manager.getContent(url), /download deadline/);
+    const first = manager.getContent(url);
     await spin(() => requests.length === 1);
     clock.advance(60);
     requests[0].response(503);
     await spin(() => requests.length === 2);
     clock.advance(20);
-    const joined = assert.rejects(manager.getContentWithInfo(url, { maxDuration: 100 }), /download deadline/);
-    clock.advance(20);
-    await Promise.all([first, joined]);
-    assert.equal(requests[1].aborted, true);
+    const joined = assert.rejects(manager.getContentWithInfo(url, { maxDuration: 100 }), /shared download deadline/);
+    await spin(() => manager.ongoingRequests.size === 1);
+    clock.advance(100);
+    await joined;
+    assert.equal(requests[1].aborted, false);
+    requests[1].succeed('{}');
+    await first;
   }));
 (async () => {
   let passed = 0;
