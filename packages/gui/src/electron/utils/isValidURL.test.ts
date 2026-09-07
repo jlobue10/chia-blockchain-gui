@@ -90,3 +90,13 @@ describe('isValidURL', () => {
     expect(isValidURL(`ipfs://${CID}/../../admin`)).toBe(false);
   });
 });
+
+describe('isValidURL length bound', () => {
+  it('refuses a uri past the validator limit before translating it', () => {
+    const longUri = `ipfs://${'/'.repeat(100_000)}x`;
+    const started = process.hrtime.bigint();
+    expect(isValidURL(longUri)).toBe(false);
+    expect(isValidURL(`https://example.com/${'a'.repeat(3000)}`)).toBe(false);
+    expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(50);
+  });
+});

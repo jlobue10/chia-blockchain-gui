@@ -76,8 +76,17 @@ const PERMANENT_NET_ERRORS = new Set([
  * cleared. Every URL this classifies comes from NFT data the minter wrote, so
  * a failure that can never clear must settle: a retry-eligible verdict on it
  * would re-probe the minter's host for as long as the wallet is open. */
+// A failure of this machine rather than of the host: descriptors or disk
+// exhausted, a file busy. It clears on its own, and a verdict on the url
+// made from it would settle the entry for something the url did nothing.
+const TRANSIENT_LOCAL_ERROR_CODES = ['EMFILE', 'ENFILE', 'EAGAIN', 'EBUSY', 'ENOSPC', 'EIO'];
+
 export function isTransientDownloadError(message: string): boolean {
   if (isDownloadTimeoutError(message)) {
+    return true;
+  }
+
+  if (TRANSIENT_LOCAL_ERROR_CODES.some((code) => message.startsWith(`${code}:`))) {
     return true;
   }
 

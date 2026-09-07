@@ -1193,6 +1193,14 @@ describe('CacheManager cache: responses', () => {
     ['application/octet-stream', 'application/octet-stream'],
     // a parameter that is not one (a smuggled header line) is not passed through
     ['image/png; x=a\r\nX-Injected: 1', 'application/octet-stream'],
+    // a value the response cannot carry is not passed through either
+    ['image/png; a="\u0000"', 'application/octet-stream'],
+    ['image/png; a="\u65e5"', 'application/octet-stream'],
+    ['image/png; a=\u00e9', 'application/octet-stream'],
+    [
+      'video/mp4; codecs="avc1.42E01E, mp4a.40.2"; charset=binary',
+      'video/mp4; codecs="avc1.42E01E, mp4a.40.2"; charset=binary',
+    ],
     ['', 'application/octet-stream'],
     [undefined, 'application/octet-stream'],
   ])('serves a stored type of %p as %p', (stored, served) => {
