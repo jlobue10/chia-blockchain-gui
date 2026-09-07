@@ -58,6 +58,8 @@ describe('isAllowedRedirect', () => {
     ['https://minter.example/a.png', 'https://nas.local./'],
     ['https://minter.example/a.png', 'https://printer.home.arpa/'],
     ['https://minter.example/a.png', 'https://vault.internal/'],
+    ['https://minter.example/a.png', 'https://home.arpa/'],
+    ['https://minter.example/a.png', 'https://internal/'],
     // a local gateway may not send the request anywhere else
     ['http://127.0.0.1:8080/ipfs/x', 'http://127.0.0.1:9090/ipfs/x'],
     ['http://127.0.0.1:8080/ipfs/x', 'http://localhost:8080/ipfs/x'],
@@ -140,6 +142,11 @@ describe('isLocalOrPrivateHost', () => {
     'nas.local.',
     'printer.home.arpa',
     'vault.internal',
+    // the zones themselves, not only names under them
+    'local',
+    'home.arpa',
+    'internal',
+    'home.arpa.',
   ])('%s is local or private', (host) => {
     expect(isLocalOrPrivateHost(host)).toBe(true);
   });
