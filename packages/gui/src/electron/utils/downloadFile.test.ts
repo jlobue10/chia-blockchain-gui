@@ -112,6 +112,10 @@ describe('isTransientDownloadError', () => {
     'net::ERR_NAME_RESOLUTION_FAILED',
     // an unknown network error keeps the benefit of the doubt
     'net::ERR_SOMETHING_NEW',
+    // this machine's own trouble, not the host's
+    'EMFILE: cache file operation failed',
+    'ENOSPC: no space left on device, write',
+    'EBUSY: resource busy or locked, rename',
   ])('treats %p as transient', (message) => {
     expect(isTransientDownloadError(message)).toBe(true);
   });
@@ -127,6 +131,8 @@ describe('isTransientDownloadError', () => {
     'Maximum file size exceeded',
     'Invalid URL',
     'Unknown error',
+    'EACCES: cache file operation failed',
+    'ENOENT: no such file or directory',
     'IPFS gateway fetching is disabled',
   ])('treats %p as permanent', (message) => {
     expect(isTransientDownloadError(message)).toBe(false);
