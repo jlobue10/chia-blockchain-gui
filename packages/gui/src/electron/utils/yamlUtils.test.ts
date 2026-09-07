@@ -43,4 +43,12 @@ describe('yamlUtils', () => {
     expect(fs.readdirSync(root)).toEqual(['prefs.yaml']);
     expect(readData(file)).toEqual({ a: 2 });
   });
+
+  it('writes even when something else occupies the temp name', () => {
+    fs.mkdirSync(`${file}.tmp`);
+    fs.writeFileSync(path.join(`${file}.tmp`, 'stray'), 'x');
+    writeData({ a: 3 }, file);
+    expect(readData(file)).toEqual({ a: 3 });
+    expect(fs.readdirSync(root)).toEqual(['prefs.yaml']);
+  });
 });

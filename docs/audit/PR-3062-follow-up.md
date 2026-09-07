@@ -128,3 +128,16 @@ The owner authorized appending unsigned commits and signing via their own
 workflow. This follow-up does not alter existing signed history. Full technical
 explanations are kept here and in source/commit comments because upstream
 Conversation/review comment writes were previously denied by the connector.
+
+## Follow-up: a joiner no longer shortens the transfer it joins
+
+The coalesced-deadline rule above let a later caller with a smaller
+allowance tighten an active transfer's deadline from its original start,
+ending it for every caller waiting on it. That made one NFT's metadata
+fetch — whose URI list is minter-authored — able to abort another NFT's
+video download by naming its URL. A joiner now waits within its own
+allowance only, measured from the transfer's start (queue wait is still
+not charged), and is refused with the spent-budget error when that runs
+out; the transfer and its other callers are untouched. A metadata caller
+still cannot inherit a video-sized wait. The harness scenarios for joining
+were rewritten to this contract.

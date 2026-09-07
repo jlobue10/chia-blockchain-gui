@@ -42,11 +42,29 @@ export default class DownloadDeadline {
     }
   }
 
+  private startWaiters: (() => void)[] = [];
+
   start() {
     if (this.startedAt === undefined) {
       this.startedAt = Date.now();
       this.schedule();
+      const waiters = this.startWaiters;
+      this.startWaiters = [];
+      waiters.forEach((resolve) => resolve());
     }
+  }
+
+  /** Resolves once the transfer has been admitted and its clock is running;
+   * at once if it already has. Lets a caller that shares the transfer wait
+   * out the queue, which no allowance is charged for, before its own clock
+   * starts. */
+  whenStarted(): Promise<void> {
+    if (this.startedAt !== undefined) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.startWaiters.push(resolve);
+    });
   }
 
   remaining(): number {

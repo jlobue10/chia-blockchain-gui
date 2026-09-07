@@ -30,6 +30,8 @@ export function writeData(data: Record<string, any>, path: string): void {
     // Written beside the file and renamed into place: a crash mid-write
     // leaves the previous file intact instead of an empty or truncated one.
     const tempPath = `${path}.tmp`;
+    // whatever is at the temp name — a leftover, a directory — is in the way
+    fs.rmSync(tempPath, { recursive: true, force: true });
     fs.writeFileSync(tempPath, yamlData, { encoding: 'utf-8' });
     fs.renameSync(tempPath, path);
   } catch (e) {
