@@ -384,3 +384,12 @@ describe('length bound', () => {
     expect(normalizeIpfsGatewayBase(`https://dweb.link/${'a'.repeat(3000)}`)).toBeUndefined();
   });
 });
+
+describe('gateway link length bound', () => {
+  it('refuses a gateway link past the validator limit without working on it', () => {
+    const longLink = `https://example.com/ipfs/${'/'.repeat(100_000)}x`;
+    const started = process.hrtime.bigint();
+    expect(getIpfsPathFromGatewayUrl(longLink)).toBeUndefined();
+    expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(50);
+  });
+});

@@ -171,7 +171,7 @@ const SUBDOMAIN_GATEWAY = /^https?:\/\/([a-z0-9]{46,})\.ipfs\.[^/?#]+(\/[^?#]*)?
 const PATH_GATEWAY = /^https?:\/\/[^/?#]+\/ipfs\/([^?#]+)(\?[^#]*)?(?:#.*)?$/i;
 
 export function getIpfsPathFromGatewayUrl(url: string): string | undefined {
-  if (typeof url !== 'string') {
+  if (typeof url !== 'string' || url.length > MAX_URL_LENGTH) {
     return undefined;
   }
 
@@ -181,13 +181,13 @@ export function getIpfsPathFromGatewayUrl(url: string): string | undefined {
   const subdomainMatch = SUBDOMAIN_GATEWAY.exec(url);
   if (subdomainMatch) {
     const [, cid, path = '', search = ''] = subdomainMatch;
-    ipfsPath = `${cid}${path.replace(/\/+$/, '')}`;
+    ipfsPath = `${cid}${trimTrailingSlashes(path)}`;
     query = search;
   } else {
     const pathMatch = PATH_GATEWAY.exec(url);
     if (pathMatch) {
       const [, path, search = ''] = pathMatch;
-      ipfsPath = path.replace(/\/+$/, '');
+      ipfsPath = trimTrailingSlashes(path);
       query = search;
     }
   }
