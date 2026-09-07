@@ -5,6 +5,7 @@ import ipfsToGatewayUrl, {
   isIpfsUrl,
   isLoopbackUrl,
   normalizeIpfsGatewayBase,
+  trimTrailingSlashes,
 } from './ipfs';
 
 // CID taken from a real mainnet NFT whose on-chain data URI is ipfs://
@@ -246,5 +247,36 @@ describe('normalizeIpfsGatewayBase', () => {
     const base = normalizeIpfsGatewayBase('https://dweb.link');
     expect(normalizeIpfsGatewayBase(base)).toBe(base);
     expect(normalizeIpfsGatewayBase(DEFAULT_IPFS_GATEWAY_BASE)).toBe(DEFAULT_IPFS_GATEWAY_BASE);
+  });
+});
+
+describe('trimTrailingSlashes', () => {
+  it('removes trailing slashes and leaves everything else', () => {
+    expect(trimTrailingSlashes('a/b///')).toBe('a/b');
+    expect(trimTrailingSlashes('a//b')).toBe('a//b');
+    expect(trimTrailingSlashes('///')).toBe('');
+    expect(trimTrailingSlashes('')).toBe('');
+  });
+
+  it('is linear on a long run of slashes that does not reach the end', () => {
+    const input = `${'/'.repeat(200_000)}x`;
+    const started = process.hrtime.bigint();
+    expect(trimTrailingSlashes(input)).toBe(input);
+    expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(50);
+  });
+});
+
+describe('length bound', () => {
+  const longUri = `ipfs://${'/'.repeat(100_000)}x`;
+
+  it('refuses an ipfs uri past the validator limit without working on it', () => {
+    const started = process.hrtime.bigint();
+    expect(getIpfsPath(longUri)).toBeUndefined();
+    expect(ipfsToGatewayUrl(longUri)).toBe(longUri);
+    expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(50);
+  });
+
+  it('refuses a gateway base past the limit', () => {
+    expect(normalizeIpfsGatewayBase(`https://dweb.link/${'a'.repeat(3000)}`)).toBeUndefined();
   });
 });
