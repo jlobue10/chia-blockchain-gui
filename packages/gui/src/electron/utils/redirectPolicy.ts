@@ -64,6 +64,24 @@ export function isLocalOrPrivateHost(hostname: string): boolean {
       const low = parseInt(mapped[3], 16);
       return isPrivateIpv4([Math.floor(high / 256), high % 256, Math.floor(low / 256), low % 256]);
     }
+    // Transition and translation forms that carry an IPv4 address: the
+    // deprecated IPv4-compatible form (::a.b.c.d / ::hex:hex), SIIT
+    // (::ffff:0:a.b.c.d), NAT64 (64:ff9b::a.b.c.d) and 6to4 (2002:hex:hex::).
+    // None is routed to this machine by a modern OS, and a cross-origin
+    // redirect must also present a trusted certificate, but the address
+    // they name is checked all the same.
+    const embedded =
+      /^(?:::|::ffff:0:|64:ff9b::)(?:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(v6);
+    const sixToFour = /^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/.exec(v6);
+    const groups = embedded ? [embedded[2], embedded[3]] : sixToFour ? [sixToFour[1], sixToFour[2]] : undefined;
+    if (embedded?.[1]) {
+      return isPrivateIpv4(embedded[1].split('.').map(Number));
+    }
+    if (groups && groups[0] !== undefined && groups[1] !== undefined) {
+      const high = parseInt(groups[0], 16);
+      const low = parseInt(groups[1], 16);
+      return isPrivateIpv4([Math.floor(high / 256), high % 256, Math.floor(low / 256), low % 256]);
+    }
     return (
       v6 === '::1' ||
       v6 === '::' ||
@@ -71,6 +89,10 @@ export function isLocalOrPrivateHost(hostname: string): boolean {
       v6.startsWith('fe9') ||
       v6.startsWith('fea') ||
       v6.startsWith('feb') ||
+      v6.startsWith('fec') ||
+      v6.startsWith('fed') ||
+      v6.startsWith('fee') ||
+      v6.startsWith('fef') ||
       v6.startsWith('fc') ||
       v6.startsWith('fd')
     );

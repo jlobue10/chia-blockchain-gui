@@ -1,6 +1,6 @@
 import isURL from 'validator/lib/isURL';
 
-import ipfsToGatewayUrl, { isIpfsUrl, isLoopbackUrl } from '../../util/ipfs';
+import ipfsToGatewayUrl, { MAX_URL_LENGTH, isIpfsUrl, isLoopbackUrl } from '../../util/ipfs';
 
 // Structural validation only — deliberately independent of the IPFS gateway
 // preference. CacheManager consults this check before every cache path
@@ -11,7 +11,9 @@ import ipfsToGatewayUrl, { isIpfsUrl, isLoopbackUrl } from '../../util/ipfs';
 // ipfs URI may actually be FETCHED is decided at the network call sites via
 // toFetchableUrl (electron/utils/ipfsGateway.ts).
 export default function isValidURL(url: string) {
-  if (typeof url !== 'string') {
+  // Nothing past the validator's length limit could be fetched; refusing it
+  // here keeps the ipfs translation below off a string a minter sized.
+  if (typeof url !== 'string' || url.length > MAX_URL_LENGTH) {
     return false;
   }
 

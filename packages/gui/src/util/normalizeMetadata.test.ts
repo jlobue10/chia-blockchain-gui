@@ -1,4 +1,10 @@
-import normalizeMetadata, { INVALID_METADATA_ERROR } from './normalizeMetadata';
+import normalizeMetadata, {
+  INVALID_METADATA_ERROR,
+  MAX_METADATA_ATTRIBUTES,
+  MAX_METADATA_NAME_LENGTH,
+  MAX_METADATA_TEXT_LENGTH,
+  MAX_METADATA_URIS,
+} from './normalizeMetadata';
 
 const CID = 'QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB';
 
@@ -54,9 +60,43 @@ describe('normalizeMetadata', () => {
     });
     expect(metadata.name).toBe('12');
     expect(metadata).not.toHaveProperty('description');
-    expect(metadata.attributes).toEqual([{ trait_type: 'Level', value: '7' }]);
+    expect(metadata.attributes).toEqual([{ trait_type: 'Level', value: 7 }]);
     expect(metadata.collection).toEqual({ id: '9' });
     expect(metadata).not.toHaveProperty('sensitive_content');
+  });
+
+  it('keeps ranking bounds and name-keyed attributes, dropping bounds that are not numbers', () => {
+    const metadata = normalizeMetadata({
+      attributes: [
+        { trait_type: 'Speed', value: 7, min_value: 0, max_value: 10 },
+        { name: 'Legacy', value: 'x' },
+        { trait_type: 'Odd', value: 'y', min_value: 'low', max_value: Number.NaN },
+      ],
+    });
+    expect(metadata.attributes).toEqual([
+      { trait_type: 'Speed', value: 7, min_value: 0, max_value: 10 },
+      { name: 'Legacy', value: 'x' },
+      { trait_type: 'Odd', value: 'y' },
+    ]);
+  });
+
+  it('bounds how much a file can make the GUI hold', () => {
+    const metadata = normalizeMetadata({
+      name: 'n'.repeat(5000),
+      description: 'd'.repeat(100_000),
+      attributes: Array.from({ length: 1000 }, (_, i) => ({ trait_type: `t${i}`, value: i })),
+      preview_image_uris: Array.from({ length: 1000 }, (_, i) => `https://example.com/${i}.png`),
+      collection: {
+        name: 'c'.repeat(5000),
+        attributes: Array.from({ length: 1000 }, () => ({ name: 'a', value: 'b' })),
+      },
+    });
+    expect(metadata.name).toHaveLength(MAX_METADATA_NAME_LENGTH);
+    expect(metadata.description).toHaveLength(MAX_METADATA_TEXT_LENGTH);
+    expect(metadata.attributes).toHaveLength(MAX_METADATA_ATTRIBUTES);
+    expect(metadata.preview_image_uris).toHaveLength(MAX_METADATA_URIS);
+    expect(metadata.collection?.name).toHaveLength(MAX_METADATA_NAME_LENGTH);
+    expect(metadata.collection?.attributes).toHaveLength(MAX_METADATA_ATTRIBUTES);
   });
 
   it.each([true, false, 'true', 'false', 'nudity', ['nudity', 'violence']])(

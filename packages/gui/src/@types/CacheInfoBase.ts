@@ -20,6 +20,9 @@ type CacheInfoBase =
       // For ipfs:// URLs: the gateway base the failed request went through,
       // so a later gateway change retries the entry immediately.
       gateway?: string;
+      // For a size-limit failure: the cap the attempt ran under, so a later
+      // caller is retried only when it allows more.
+      maxSize?: number;
     };
 
 export default CacheInfoBase;
