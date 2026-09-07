@@ -81,4 +81,19 @@ describe('DownloadDeadline.whenStarted', () => {
     await expect(deadline.whenStarted()).resolves.toBeUndefined();
     deadline.finish();
   });
+
+  it('resolves when the request finishes without a transfer, and at once afterwards', async () => {
+    const deadline = new DownloadDeadline(1000, () => {});
+    let woken = false;
+    const waited = deadline.whenStarted().then(() => {
+      woken = true;
+    });
+    await Promise.resolve();
+    expect(woken).toBe(false);
+    // served from the cache: finished, never started
+    deadline.finish();
+    await waited;
+    expect(woken).toBe(true);
+    await expect(deadline.whenStarted()).resolves.toBeUndefined();
+  });
 });

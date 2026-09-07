@@ -48,23 +48,29 @@ export default class DownloadDeadline {
     if (this.startedAt === undefined) {
       this.startedAt = Date.now();
       this.schedule();
-      const waiters = this.startWaiters;
-      this.startWaiters = [];
-      waiters.forEach((resolve) => resolve());
+      this.wakeStartWaiters();
     }
   }
 
-  /** Resolves once the transfer has been admitted and its clock is running;
-   * at once if it already has. Lets a caller that shares the transfer wait
-   * out the queue, which no allowance is charged for, before its own clock
-   * starts. */
+  /** Resolves once the transfer has been admitted and its clock is running,
+   * or once the request has finished without one — served from the cache,
+   * settled from a persisted failure — and at once if either has already
+   * happened. Lets a caller that shares the request wait out the queue,
+   * which no allowance is charged for, before its own clock starts, without
+   * waiting on a transfer that will never start. */
   whenStarted(): Promise<void> {
-    if (this.startedAt !== undefined) {
+    if (this.startedAt !== undefined || this.finishedAt !== undefined) {
       return Promise.resolve();
     }
     return new Promise((resolve) => {
       this.startWaiters.push(resolve);
     });
+  }
+
+  private wakeStartWaiters() {
+    const waiters = this.startWaiters;
+    this.startWaiters = [];
+    waiters.forEach((resolve) => resolve());
   }
 
   remaining(): number {
@@ -91,6 +97,8 @@ export default class DownloadDeadline {
   finish() {
     this.finishedAt = Date.now();
     this.dispose();
+    // a request that never transferred still has callers waiting on it
+    this.wakeStartWaiters();
   }
 
   elapsed(): number {
