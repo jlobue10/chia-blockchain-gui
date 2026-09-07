@@ -502,7 +502,8 @@ export default class CacheManager extends EventEmitter {
         (retries < MAX_TRANSIENT_RETRIES && Date.now() - cacheInfo.timestamp >= transientErrorRetryDelay(retries)));
     // A persisted size-limit error is only retried when the caller lifts
     // the limit, so oversized files are not re-downloaded on every visit.
-    const isSizeLimitLifted = cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize > MAX_FILE_SIZE;
+    const isSizeLimitLifted =
+      cacheInfo.error === MAX_FILE_SIZE_EXCEEDED_ERROR && maxSize > (cacheInfo.maxSize ?? MAX_FILE_SIZE);
     // An ipfs failure is a verdict on one gateway, not on the resource:
     // once the user points the option at another gateway the entry is
     // re-requested right away, whatever the error was and however
@@ -593,10 +594,37 @@ export default class CacheManager extends EventEmitter {
       }
     };
 
+    // Waiting on another caller's transfer, for this caller's own allowance
+    // and no longer. The transfer itself is left as it is: its deadline is
+    // its owner's, and a caller with a smaller allowance — a metadata fetch
+    // whose NFT lists the url another NFT's video is downloading from — must
+    // not be able to end it for everyone waiting on it. Queue wait is not
+    // charged, as for a transfer of one's own; the clock starts with the
+    // transfer's. A caller whose allowance runs out is refused with the
+    // spent-budget error, nothing persisted, and charged for what it waited.
+    const joinWithinBudget = async (request: { promise: Promise<CacheInfo>; deadline: DownloadDeadline }) => {
+      await request.deadline.whenStarted();
+      const startedAt = Date.now();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          request.promise,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new SharedDownloadBudgetSpentError()), maxDuration);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        // eslint-disable-next-line no-param-reassign -- The wait consumes the caller's shared allowance.
+        budget.remaining = Math.max(0, budget.remaining - (Date.now() - startedAt));
+      }
+    };
+
     const ongoingRequest = this.ongoingRequests.get(url);
     if (ongoingRequest) {
       log('Request already ongoing', url);
-      ongoingRequest.deadline.constrain(maxDuration);
 
       if (ongoingRequest.gateway !== requestGateway) {
         // The in-flight request went through a gateway the user has since
@@ -607,10 +635,10 @@ export default class CacheManager extends EventEmitter {
         // caller would inherit the old gateway's error until the retry delay
         // elapsed.
         const lookAgain = () => this.fetchRemoteContent(url, options, budget);
-        return consume(ongoingRequest).then(lookAgain, lookAgain);
+        return joinWithinBudget(ongoingRequest).then(lookAgain, lookAgain);
       }
 
-      return consume(ongoingRequest);
+      return joinWithinBudget(ongoingRequest);
     }
 
     const abortController = new AbortController();
@@ -761,6 +789,9 @@ export default class CacheManager extends EventEmitter {
         return await this.setCacheInfo(url, {
           state: CacheState.ERROR,
           error: currentError.message,
+          // the cap this attempt ran under, so a later caller with a larger
+          // one is retried and one with the same or a smaller one is not
+          ...(currentError.message === MAX_FILE_SIZE_EXCEEDED_ERROR ? { maxSize } : {}),
           ...(isTransient ? { retries: this.consecutiveTransientFailures(previousCacheInfo, requestGateway) + 1 } : {}),
           // which gateway the verdict belongs to (see isGatewayChanged above)
           ...(requestGateway === undefined ? {} : { gateway: requestGateway }),
@@ -896,7 +927,17 @@ export default class CacheManager extends EventEmitter {
       // eslint-disable-next-line no-await-in-loop -- Read the completed destination, not a half-migrated pair.
       await this.maintenance.catch(() => {});
     }
-    const content = await fs.readFile(this.getCacheFilePath(url));
+    const filePath = this.getCacheFilePath(url);
+    // A file another caller cached under a larger cap — a data file that is
+    // also the NFT's metadata — is not handed to a caller whose cap it
+    // exceeds: the cap is what keeps the renderer from decoding and parsing
+    // that much on its thread. The entry stays cached for callers it fits.
+    const maxSize = normalizeMaxSize(options?.maxSize);
+    const { size } = await fs.stat(filePath);
+    if (size > maxSize) {
+      throw new Error(MAX_FILE_SIZE_EXCEEDED_ERROR);
+    }
+    const content = await fs.readFile(filePath);
     return {
       content,
       headers: cacheInfo.headers,

@@ -852,6 +852,87 @@ describe('CacheManager eviction', () => {
     expect(mockDownloadFile).toHaveBeenCalledTimes(1);
   });
 
+  it('refuses a joiner after its own allowance without ending the transfer it joined', async () => {
+    const payload = Buffer.from('video bytes');
+    const url = 'https://example.com/video.mp4';
+    let finishDownload!: () => Promise<void>;
+    let aborted = false;
+    mockDownloadFile.mockImplementationOnce(
+      (_url, localPath, options) =>
+        new Promise((resolve, reject) => {
+          options?.signal?.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(new Error('Request aborted'));
+            },
+            { once: true },
+          );
+          finishDownload = async () => {
+            await fs.writeFile(localPath, payload);
+            resolve({ 'content-type': 'video/mp4' });
+          };
+        }),
+    );
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 });
+    await cacheManager.init();
+
+    // another NFT's tile is downloading the video
+    const owner = cacheManager.getContent(url);
+    await untilDownloadsStarted(1);
+    // a metadata fetch whose NFT lists the same url joins with a small allowance
+    await expect(cacheManager.fetchRemoteContent(url, { maxDuration: 40 })).rejects.toThrow('shared download deadline');
+    // ... and the video transfer is still running, untouched
+    expect(aborted).toBe(false);
+    await finishDownload();
+    await expect(owner).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info.state).toBe('CACHED');
+  });
+
+  it('does not hand a cached file to a caller whose cap it exceeds, and keeps it for callers it fits', async () => {
+    const payload = Buffer.alloc(3000, 1);
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'application/json' };
+    });
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 * 1024 });
+    await cacheManager.init();
+    const url = 'https://example.com/data.json';
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    await expect(cacheManager.getContentWithInfo(url, { maxSize: 2000 })).rejects.toThrow('Maximum file size exceeded');
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a size-limit failure only for a caller that allows more than the cap it failed under', async () => {
+    const url = 'https://example.com/big.json';
+    mockDownloadFile.mockRejectedValueOnce(new Error('Maximum file size exceeded'));
+    const cacheManager = new CacheManager({ cacheDirectory, maxCacheSize: 1024 * 1024 });
+    await cacheManager.init();
+    await expect(cacheManager.getContent(url, { maxSize: 5 * 1024 * 1024 })).rejects.toThrow(
+      'Maximum file size exceeded',
+    );
+    const [info] = await cacheManager.getCacheInfos([url]);
+    expect(info).toMatchObject({ state: 'ERROR', maxSize: 5 * 1024 * 1024 });
+
+    // the same cap: settled, no second transfer
+    await expect(cacheManager.getContent(url, { maxSize: 5 * 1024 * 1024 })).rejects.toThrow(
+      'Maximum file size exceeded',
+    );
+    expect(mockDownloadFile).toHaveBeenCalledTimes(1);
+
+    // a larger cap (the data verifier's default): tried again
+    const payload = Buffer.from('fits now');
+    mockDownloadFile.mockImplementation(async (_url, localPath) => {
+      await fs.writeFile(localPath, payload);
+      return { 'content-type': 'application/json' };
+    });
+    await expect(cacheManager.getContent(url)).resolves.toEqual(payload);
+    expect(mockDownloadFile).toHaveBeenCalledTimes(2);
+  });
+
   it('does not fall back to the gateway once the host has used up the whole download deadline', async () => {
     const url = 'https://nftstorage.link/ipfs/QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB/img.png';
     let now = Date.now();
